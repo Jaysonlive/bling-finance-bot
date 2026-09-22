@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from bling import BlingAuthError, BlingClient
 from config import ConfigError, Settings
@@ -29,16 +29,12 @@ def extract_code_and_state(value: str) -> tuple[str, str | None]:
 async def run() -> None:
     settings = Settings.from_env()
     state = secrets.token_urlsafe(24)
-    authorize_url = (
-        f"{BlingClient.AUTHORIZE_URL}?"
-        + urlencode(
-            {
-                "response_type": "code",
-                "client_id": settings.bling_client_id,
-                "state": state,
-            }
-        )
+    client = BlingClient(
+        client_id=settings.bling_client_id,
+        client_secret=settings.bling_client_secret,
+        token_file=settings.bling_token_file,
     )
+    authorize_url = client.build_authorize_url(state)
 
     print("\n=== Autorização inicial do Bling ===\n")
     print("1) Abra AGORA esta URL no navegador e autorize o aplicativo:\n")
@@ -61,11 +57,6 @@ async def run() -> None:
             "Operação interrompida por segurança."
         )
 
-    client = BlingClient(
-        client_id=settings.bling_client_id,
-        client_secret=settings.bling_client_secret,
-        token_file=settings.bling_token_file,
-    )
     try:
         await client.bootstrap_authorization_code(code)
     finally:

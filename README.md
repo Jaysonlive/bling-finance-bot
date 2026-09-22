@@ -24,7 +24,7 @@ Exemplo:
 - Paginação integral da API, com `limite=100` e avanço de `pagina` até o fim dos resultados.
 - Títulos parcialmente pagos/recebidos usam o campo `saldo` do detalhe da conta, em vez do valor original.
 - Intervalos maiores que o limite aceito pela API são divididos automaticamente em blocos menores.
-- OAuth 2.0 com renovação automática de `access_token` e persistência do `refresh_token` rotativo.
+- OAuth 2.0 com autorização inicial/reautorização diretamente pelo Telegram, renovação automática de `access_token` e persistência do `refresh_token` rotativo.
 - Tokens gravados de forma atômica em `/app/data/bling_tokens.json`.
 - Lock assíncrono para impedir duas renovações simultâneas no mesmo processo.
 - Renovação preventiva 5 minutos antes do vencimento.
@@ -141,60 +141,58 @@ LOG_LEVEL=INFO
 
 O `.env` está no `.gitignore` e **não deve ser commitado**.
 
-## 4. Primeiro OAuth do Bling
+## 4. Autorizar o Bling pelo próprio Telegram
 
-O projeto inclui `oauth_setup.py` justamente para criar o primeiro arquivo de tokens sem precisar editar JSON manualmente.
+A forma recomendada é fazer todo o bootstrap OAuth pelo bot, sem abrir o terminal do EasyPanel.
 
-### Opção recomendada: executar dentro do container já publicado no EasyPanel
+Depois que o serviço estiver publicado e o volume `/app/data` estiver montado, envie no Telegram:
 
-Primeiro faça o deploy do serviço com as variáveis de ambiente e o volume `/app/data` já configurados. O bot pode iniciar sem o token do Bling; as consultas financeiras apenas ficarão indisponíveis até concluir esta etapa.
+```text
+/autorizar
+```
 
-No terminal/shell do serviço no EasyPanel execute:
+O bot enviará um botão **Abrir autorização do Bling**. O fluxo é:
+
+1. Toque no botão.
+2. Entre no Bling e autorize o aplicativo.
+3. O Bling redirecionará para a URL cadastrada no aplicativo.
+4. Copie a **URL completa** da barra do navegador, incluindo `code=` e `state=`.
+5. Volte ao Telegram e cole essa URL como uma mensagem para o bot.
+6. O bot extrai o `code`, valida o `state`, troca o código por tokens e grava em `/app/data/bling_tokens.json`.
+
+Exemplo de URL de retorno:
+
+```text
+https://seu-callback.exemplo/?code=ABC123&state=XYZ456
+```
+
+O `authorization_code` expira rapidamente, portanto cole a URL no Telegram logo após o redirecionamento.
+
+Quando tudo der certo, o bot responderá:
+
+```text
+✅ Bling autenticado com sucesso.
+
+Os tokens foram salvos no volume persistente e a renovação automática está ativa.
+```
+
+Você também pode consultar a conexão com:
+
+```text
+/status_bling
+```
+
+ou pelo botão **Bling / Conexão** do menu.
+
+### Método de emergência pelo terminal
+
+O arquivo `oauth_setup.py` foi mantido como fallback administrativo. Se por algum motivo o fluxo pelo Telegram não puder ser usado, execute dentro do container:
 
 ```bash
 python oauth_setup.py
 ```
 
-O script mostrará uma URL semelhante a:
-
-```text
-https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=...&state=...
-```
-
-Faça o seguinte sem demora:
-
-1. Abra a URL exibida.
-2. Entre no Bling e autorize o aplicativo.
-3. O Bling redirecionará para a URL cadastrada no aplicativo.
-4. Copie a **URL completa** que aparecer na barra do navegador, incluindo `code=` e `state=`.
-5. Cole essa URL no terminal onde `oauth_setup.py` está aguardando.
-
-O Bling informa que o `authorization_code` expira rapidamente (aproximadamente 1 minuto), então a troca deve ser feita logo após a autorização.
-
-Se tudo estiver correto, o script gravará:
-
-```text
-/app/data/bling_tokens.json
-```
-
-Depois disso, reinicie o serviço ou simplesmente utilize o bot; o cliente também consegue carregar o arquivo de forma preguiçosa na primeira consulta.
-
-### Fazer o bootstrap localmente com Docker
-
-Também é possível:
-
-```bash
-docker build -t bling-finance-bot .
-mkdir -p data
-
-docker run --rm -it \
-  --env-file .env \
-  -v "$(pwd)/data:/app/data" \
-  bling-finance-bot \
-  python oauth_setup.py
-```
-
-Depois será necessário transferir com segurança o `bling_tokens.json` gerado para o volume persistente do servidor. Para evitar esse passo, prefira executar `oauth_setup.py` diretamente no container do EasyPanel.
+O script gera o mesmo link OAuth e permite colar a URL de retorno no terminal. No uso normal, isso não é necessário.
 
 ## 5. Rodar localmente sem Docker
 
@@ -222,13 +220,7 @@ Se estiver rodando sem Docker, altere temporariamente no `.env`:
 BLING_TOKEN_FILE=./data/bling_tokens.json
 ```
 
-Faça o OAuth inicial:
-
-```bash
-python oauth_setup.py
-```
-
-Depois inicie:
+Inicie o bot:
 
 ```bash
 python bot.py
@@ -251,12 +243,14 @@ ou:
 Comandos disponíveis:
 
 ```text
-/start      abre o menu principal
-/menu       abre o menu principal
-/pagar      períodos de contas a pagar
-/receber    períodos de contas a receber
-/fluxo      períodos de fluxo por botões
+/start          abre o menu principal
+/menu           abre o menu principal
+/pagar          períodos de contas a pagar
+/receber        períodos de contas a receber
+/fluxo          períodos de fluxo por botões
 /fluxo 2026-01-01 2026-12-31
+/autorizar      gera o link OAuth do Bling no Telegram
+/status_bling   mostra o status da conexão
 ```
 
 Teste primeiro períodos curtos, por exemplo "Hoje". Depois teste mês e ano.
@@ -348,11 +342,14 @@ Este projeto usa um lock assíncrono em memória para proteger a renovação do 
 1. Configure Environment.
 2. Configure o Volume em `/app/data`.
 3. Faça Deploy.
-4. Abra o terminal do serviço.
-5. Execute `python oauth_setup.py`.
-6. Autorize no Bling e cole a URL de retorno.
-7. Confirme que existe `/app/data/bling_tokens.json`.
-8. Teste `/start` no Telegram.
+4. Abra o Telegram e envie `/start`.
+5. Entre em **Bling / Conexão** ou envie `/autorizar`.
+6. Toque no link de autorização do Bling.
+7. Autorize, copie a URL completa do redirecionamento e cole no Telegram.
+8. O bot salvará `/app/data/bling_tokens.json` automaticamente.
+9. Teste um relatório pelo menu.
+
+Não é necessário expor porta HTTP nem criar domínio para o bot: o Telegram continua usando long polling e o retorno OAuth é colado manualmente no chat.
 
 ## 9. Segurança
 
@@ -426,11 +423,13 @@ Na renovação:
 
 Se uma chamada normal retornar HTTP 401, o cliente força uma renovação e repete a chamada uma vez.
 
-Se o refresh token deixar de ser válido/revogado, execute novamente:
+Se o refresh token deixar de ser válido ou for revogado, o bot exibirá a opção de autorização. Use:
 
-```bash
-python oauth_setup.py
+```text
+/autorizar
 ```
+
+O `oauth_setup.py` permanece disponível apenas como fallback administrativo.
 
 ## 12. Endpoints utilizados
 
@@ -454,13 +453,13 @@ O projeto não usa a URL antiga `https://bling.com.br/Api/v3`, cuja descontinua�
 
 ### `Tokens do Bling ainda não foram configurados`
 
-Execute:
+No Telegram envie:
 
-```bash
-python oauth_setup.py
+```text
+/autorizar
 ```
 
-no container com `/app/data` persistente já montado.
+Abra o link, autorize no Bling e cole a URL completa de retorno no chat. Confirme antes que `/app/data` está montado como volume persistente.
 
 ### HTTP 403
 
@@ -468,7 +467,7 @@ Normalmente indica que o usuário/app não concedeu o escopo necessário. Revise
 
 ### HTTP 401 recorrente
 
-O cliente tenta renovar automaticamente. Se a renovação falhar, refaça `oauth_setup.py`.
+O cliente tenta renovar automaticamente. Se a renovação falhar, use `/autorizar` no Telegram para reautorizar a conta.
 
 ### HTTP 429
 

@@ -10,6 +10,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from urllib.parse import urlencode
 
 import httpx
 
@@ -117,6 +118,22 @@ class BlingClient:
                 "enable-jwt": "1",
                 "User-Agent": "bling-finance-telegram-bot/1.0",
             },
+        )
+
+    def build_authorize_url(self, state: str) -> str:
+        """Build the Bling OAuth authorization URL for a caller-generated state."""
+        state = state.strip()
+        if not state:
+            raise ValueError("OAuth state não pode ser vazio.")
+        return (
+            f"{self.AUTHORIZE_URL}?"
+            + urlencode(
+                {
+                    "response_type": "code",
+                    "client_id": self.client_id,
+                    "state": state,
+                }
+            )
         )
 
     async def close(self) -> None:
@@ -242,7 +259,7 @@ class BlingClient:
                         self._tokens = await asyncio.to_thread(self._read_token_file)
             else:
                 raise BlingAuthError(
-                    "Tokens do Bling ainda não foram configurados. Execute oauth_setup.py."
+                    "Tokens do Bling ainda não foram configurados. Use /autorizar no Telegram."
                 )
 
         assert self._tokens is not None
