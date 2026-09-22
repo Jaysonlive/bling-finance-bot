@@ -79,6 +79,8 @@ def format_period(start: date, end: date) -> str:
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("💳 Saldos — Caixas e Bancos", callback_data="cash:menu")],
+            [InlineKeyboardButton("💼 Posição financeira", callback_data="position:menu")],
             [InlineKeyboardButton("💸 Contas a pagar", callback_data="choose:pay")],
             [InlineKeyboardButton("💰 Contas a receber", callback_data="choose:recv")],
             [InlineKeyboardButton("📊 Fluxo líquido", callback_data="choose:flow")],
@@ -98,6 +100,52 @@ def period_keyboard(kind: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Mês", callback_data=f"report:{kind}:month"),
                 InlineKeyboardButton("Ano", callback_data=f"report:{kind}:year"),
             ],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+        ]
+    )
+
+
+def cash_summary_keyboard(accounts: tuple) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for account in accounts[:25]:
+        label = account.description
+        if len(label) > 42:
+            label = label[:39] + "..."
+        rows.append(
+            [InlineKeyboardButton(f"🏦 {label}", callback_data=f"cash:account:{account.account_id}")]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton("🔄 Atualizar saldos", callback_data="cash:refresh")],
+            [InlineKeyboardButton("💼 Posição financeira", callback_data="position:menu")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def cash_account_keyboard(account_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔄 Atualizar conta", callback_data=f"cash:accountrefresh:{account_id}"
+                )
+            ],
+            [InlineKeyboardButton("💳 Todos os saldos", callback_data="cash:menu")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+        ]
+    )
+
+
+def position_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Até fim do mês", callback_data="position:month"),
+                InlineKeyboardButton("Até fim do ano", callback_data="position:year"),
+            ],
+            [InlineKeyboardButton("💳 Ver saldos", callback_data="cash:menu")],
             [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
         ]
     )
@@ -205,7 +253,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.effective_message.reply_text(
         "Financeiro Bling\n\n"
-        "Consulte títulos em aberto/parciais por vencimento e o fluxo líquido projetado.\n"
+        "Consulte saldos registrados em Caixas e Bancos, títulos pendentes e projeções financeiras.\n"
         "Escolha uma opção:",
         reply_markup=menu_keyboard(),
     )
@@ -229,6 +277,53 @@ async def receive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.effective_message.reply_text(
         "💰 Contas a receber — escolha o período:", reply_markup=period_keyboard("recv")
     )
+
+
+async def saldos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    await update.effective_chat.send_action(ChatAction.TYPING)
+    await _send_cash_summary(update, context, edit=False, force_refresh=False)
+
+
+async def posicao_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "💼 Posição financeira\n\n"
+            "Combina o saldo registrado em Caixas e Bancos com contas a receber e a pagar.\n"
+            "Escolha um horizonte ou use:\n"
+            "/posicao YYYY-MM-DD YYYY-MM-DD",
+            reply_markup=position_keyboard(),
+        )
+        return
+
+    if len(context.args) != 2:
+        await update.effective_message.reply_text(
+            "Uso correto: /posicao YYYY-MM-DD YYYY-MM-DD\n"
+            "Exemplo: /posicao 2026-09-22 2026-12-31"
+        )
+        return
+
+    try:
+        start = date.fromisoformat(context.args[0])
+        end = date.fromisoformat(context.args[1])
+    except ValueError:
+        await update.effective_message.reply_text(
+            "Data inválida. Use exatamente o formato YYYY-MM-DD."
+        )
+        return
+
+    if end < start:
+        await update.effective_message.reply_text(
+            "A data final não pode ser anterior à data inicial."
+        )
+        return
+
+    await update.effective_chat.send_action(ChatAction.TYPING)
+    await _send_financial_position(update, context, start, end, edit=False)
 
 
 async def fluxo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -428,6 +523,187 @@ async def oauth_callback_message(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+def _cash_scope_message(exc: BlingAuthError) -> str:
+    detail = str(exc).lower()
+    if "403" in detail or "escopo" in detail or "scope" in detail:
+        return (
+            "🔐 O aplicativo ainda não tem acesso a Caixas e Bancos.\n\n"
+            "No cadastro do aplicativo no Bling, habilite o escopo de leitura “Caixas e Bancos” "
+            "e depois use /autorizar para reautorizar a conta."
+        )
+    return (
+        "🔐 A conexão com o Bling precisa ser autorizada ou renovada.\n\n"
+        "Use /autorizar para conectar novamente."
+    )
+
+
+def _cash_summary_text(summary) -> str:
+    lines = ["💳 Saldos — Caixas e Bancos", ""]
+    if not summary.accounts:
+        lines.append("Nenhum lançamento financeiro foi retornado pelo Bling.")
+    else:
+        for account in summary.accounts:
+            lines.append(f"🏦 {account.description}: {format_brl(account.balance)}")
+        lines.extend(
+            [
+                "",
+                f"💵 Total registrado no Bling: {format_brl(summary.total_balance)}",
+                "",
+                "ℹ️ Saldo calculado pelos lançamentos de Caixas e Bancos. "
+                "Não é consulta em tempo real ao internet banking.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+async def _send_cash_summary(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit: bool,
+    force_refresh: bool,
+) -> None:
+    bling: BlingClient = context.application.bot_data["bling"]
+    auth_error = False
+    accounts: tuple = ()
+    try:
+        summary = await bling.get_cash_summary(force_refresh=force_refresh)
+        text = _cash_summary_text(summary)
+        accounts = summary.accounts
+    except BlingAuthError as exc:
+        logger.warning("Sem autorização para Caixas e Bancos: %s", exc)
+        auth_error = True
+        text = _cash_scope_message(exc)
+    except BlingAPIError as exc:
+        logger.exception("Erro ao consultar Caixas e Bancos")
+        text = (
+            "⚠️ Não foi possível consultar Caixas e Bancos agora.\n"
+            f"Detalhe técnico: {str(exc)[:700]}"
+        )
+    except Exception:
+        logger.exception("Erro inesperado ao consultar saldos de Caixas e Bancos")
+        text = "⚠️ Ocorreu um erro inesperado ao consultar os saldos. Consulte os logs."
+
+    keyboard = auth_required_keyboard() if auth_error else cash_summary_keyboard(accounts)
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+
+async def _send_cash_account(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    account_id: str,
+    *,
+    force_refresh: bool,
+) -> None:
+    bling: BlingClient = context.application.bot_data["bling"]
+    tz: ZoneInfo = context.application.bot_data["timezone"]
+    today = datetime.now(tz).date()
+    month_start = date(today.year, today.month, 1)
+
+    try:
+        account, movements = await bling.get_cash_account(
+            account_id, force_refresh=force_refresh
+        )
+        month_movements = [
+            movement
+            for movement in movements
+            if movement.movement_date is not None
+            and month_start <= movement.movement_date <= today
+        ]
+        month_credits = sum(
+            (m.amount for m in month_movements if m.direction == "C"), Decimal("0")
+        )
+        month_debits = sum(
+            (m.amount for m in month_movements if m.direction == "D"), Decimal("0")
+        )
+        lines = [
+            f"🏦 {account.description}",
+            "",
+            f"Saldo registrado: {format_brl(account.balance)}",
+            "",
+            f"Entradas no mês: {format_brl(month_credits)}",
+            f"Saídas no mês: {format_brl(month_debits)}",
+            f"Movimento líquido no mês: {format_brl(month_credits - month_debits)}",
+            f"Lançamentos históricos: {account.movement_count}",
+        ]
+        recent = list(movements[:8])
+        if recent:
+            lines.extend(["", "📋 Últimos lançamentos:"])
+            for movement in recent:
+                when = (
+                    movement.movement_date.strftime("%d/%m/%Y")
+                    if movement.movement_date
+                    else "sem data"
+                )
+                sign = "+" if movement.direction == "C" else "-"
+                desc = movement.description or "Lançamento"
+                if len(desc) > 44:
+                    desc = desc[:41] + "..."
+                lines.append(
+                    f"{when} • {sign}{format_brl(movement.amount).replace('R$ ', 'R$ ')} • {desc}"
+                )
+        text = "\n".join(lines)
+        keyboard = cash_account_keyboard(account.account_id)
+    except BlingAuthError as exc:
+        text = _cash_scope_message(exc)
+        keyboard = auth_required_keyboard()
+    except BlingAPIError as exc:
+        text = f"⚠️ Não foi possível abrir essa conta.\nDetalhe: {str(exc)[:600]}"
+        keyboard = cash_summary_keyboard(())
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+
+
+async def _send_financial_position(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    start: date,
+    end: date,
+    *,
+    edit: bool,
+) -> None:
+    bling: BlingClient = context.application.bot_data["bling"]
+    auth_error = False
+    try:
+        cash = await bling.get_cash_summary()
+        flow = await bling.get_financial_summary(start, end)
+        projected = cash.total_balance + flow.net
+        signal = "🟢" if projected >= 0 else "🔴"
+        text = (
+            "💼 Posição financeira\n"
+            f"📅 Projeção: {format_period(start, end)}\n\n"
+            f"💳 Saldo atual no Bling: {format_brl(cash.total_balance)}\n"
+            f"💰 A receber no período: {format_brl(flow.receivable.total)} "
+            f"({flow.receivable.count} títulos)\n"
+            f"💸 A pagar no período: {format_brl(flow.payable.total)} "
+            f"({flow.payable.count} títulos)\n"
+            f"📊 Movimento futuro líquido: {format_brl(flow.net)}\n\n"
+            f"{signal} Saldo projetado: {format_brl(projected)}\n\n"
+            "ℹ️ Saldo atual = lançamentos registrados em Caixas e Bancos; "
+            "não é saldo bancário em tempo real."
+        )
+    except BlingAuthError as exc:
+        logger.warning("Sem autorização ao calcular posição financeira: %s", exc)
+        auth_error = True
+        text = _cash_scope_message(exc)
+    except BlingAPIError as exc:
+        logger.exception("Erro ao calcular posição financeira")
+        text = f"⚠️ Não foi possível calcular a posição financeira.\nDetalhe: {str(exc)[:700]}"
+    except Exception:
+        logger.exception("Erro inesperado ao calcular posição financeira")
+        text = "⚠️ Ocorreu um erro inesperado ao calcular a posição financeira."
+
+    keyboard = auth_required_keyboard() if auth_error else position_keyboard()
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+    elif update.effective_message:
+        await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_allowed(update, context):
         return
@@ -441,6 +717,56 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             "Financeiro Bling — escolha uma opção:", reply_markup=menu_keyboard()
         )
+        return
+
+    if data == "cash:menu":
+        await query.edit_message_text(
+            "⏳ Consultando saldos de Caixas e Bancos...\n"
+            "A primeira consulta pode levar alguns segundos."
+        )
+        await _send_cash_summary(update, context, edit=True, force_refresh=False)
+        return
+
+    if data == "cash:refresh":
+        await query.edit_message_text("⏳ Atualizando saldos de Caixas e Bancos...")
+        await _send_cash_summary(update, context, edit=True, force_refresh=True)
+        return
+
+    if data.startswith("cash:accountrefresh:"):
+        account_id = data.split(":", 2)[2]
+        await query.edit_message_text("⏳ Atualizando conta financeira...")
+        await _send_cash_account(
+            update, context, account_id, force_refresh=True
+        )
+        return
+
+    if data.startswith("cash:account:"):
+        account_id = data.split(":", 2)[2]
+        await query.edit_message_text("⏳ Carregando conta financeira...")
+        await _send_cash_account(
+            update, context, account_id, force_refresh=False
+        )
+        return
+
+    if data == "position:menu":
+        await query.edit_message_text(
+            "💼 Posição financeira\n\n"
+            "Escolha até onde deseja projetar o saldo. "
+            "Também é possível usar /posicao YYYY-MM-DD YYYY-MM-DD.",
+            reply_markup=position_keyboard(),
+        )
+        return
+
+    if data in {"position:month", "position:year"}:
+        tz: ZoneInfo = context.application.bot_data["timezone"]
+        today = datetime.now(tz).date()
+        if data == "position:month":
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            end = date(today.year, today.month, last_day)
+        else:
+            end = date(today.year, 12, 31)
+        await query.edit_message_text("⏳ Calculando posição financeira...")
+        await _send_financial_position(update, context, today, end, edit=True)
         return
 
     if data == "bling:menu":
@@ -585,6 +911,8 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Abrir menu financeiro"),
+            BotCommand("saldos", "Saldos de Caixas e Bancos"),
+            BotCommand("posicao", "Saldo atual + projeção financeira"),
             BotCommand("fluxo", "Fluxo por período ou datas livres"),
             BotCommand("pagar", "Contas a pagar"),
             BotCommand("receber", "Contas a receber"),
@@ -633,6 +961,8 @@ def main() -> None:
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("pagar", pay_command))
     application.add_handler(CommandHandler("receber", receive_command))
+    application.add_handler(CommandHandler("saldos", saldos_command))
+    application.add_handler(CommandHandler("posicao", posicao_command))
     application.add_handler(CommandHandler("fluxo", fluxo_command))
     application.add_handler(CommandHandler("autorizar", authorize_command))
     application.add_handler(CommandHandler("status_bling", bling_status_command))

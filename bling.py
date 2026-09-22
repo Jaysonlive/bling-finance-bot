@@ -69,6 +69,41 @@ class FinancialSummary:
         return self.receivable.total - self.payable.total
 
 
+@dataclass(frozen=True, slots=True)
+class CashMovement:
+    id: str
+    account_id: str
+    account_name: str
+    movement_date: date | None
+    direction: str
+    amount: Decimal
+    description: str
+
+    @property
+    def signed_amount(self) -> Decimal:
+        return self.amount if self.direction == "C" else -self.amount
+
+
+@dataclass(frozen=True, slots=True)
+class CashAccountBalance:
+    account_id: str
+    description: str
+    balance: Decimal
+    credits: Decimal
+    debits: Decimal
+    movement_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CashSummary:
+    accounts: tuple[CashAccountBalance, ...]
+    movements: tuple[CashMovement, ...]
+
+    @property
+    def total_balance(self) -> Decimal:
+        return sum((account.balance for account in self.accounts), Decimal("0"))
+
+
 class BlingClient:
     """
     Async Bling API v3 client.
@@ -93,6 +128,7 @@ class BlingClient:
     # 0.38s between requests ~= 2.63 req/s, leaving margin below 3 req/s.
     MIN_REQUEST_INTERVAL_SECONDS = 0.38
     MAX_RETRIES = 3
+    CASH_CACHE_SECONDS = 300
 
     def __init__(
         self,
@@ -109,6 +145,9 @@ class BlingClient:
         self._token_lock = asyncio.Lock()
         self._rate_lock = asyncio.Lock()
         self._last_request_at = 0.0
+        self._cash_cache: CashSummary | None = None
+        self._cash_cache_at = 0.0
+        self._cash_cache_lock = asyncio.Lock()
         self._http = httpx.AsyncClient(
             base_url=self.API_BASE_URL,
             timeout=httpx.Timeout(timeout_seconds),
@@ -548,3 +587,222 @@ class BlingClient:
             receivable=receivable,
             payable=payable,
         )
+
+    @staticmethod
+    def _first_value(row: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in row and row[key] not in (None, ""):
+                return row[key]
+        return None
+
+    @staticmethod
+    def _nested_value(row: dict[str, Any], object_keys: Sequence[str], field: str) -> Any:
+        for object_key in object_keys:
+            value = row.get(object_key)
+            if isinstance(value, dict) and value.get(field) not in (None, ""):
+                return value.get(field)
+        return None
+
+    @staticmethod
+    def _parse_api_date(value: Any) -> date | None:
+        if value in (None, ""):
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw[:10])
+        except ValueError:
+            return None
+
+    async def list_cash_entries(
+        self,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> list[dict[str, Any]]:
+        """List Caixas e Bancos movements using Bling's paginated GET /caixas.
+
+        With no dates, Bling returns the account history page by page. Date filters are
+        used only when both bounds are provided. Current Bling versions accept ISO
+        YYYY-MM-DD for dataInicial/dataFinal.
+        """
+        if (start is None) != (end is None):
+            raise ValueError("Informe data inicial e final juntas.")
+        if start is not None and end is not None and end < start:
+            raise ValueError("A data final não pode ser anterior à data inicial.")
+
+        rows: list[dict[str, Any]] = []
+        ranges: Iterable[tuple[date | None, date | None]]
+        if start is None:
+            ranges = ((None, None),)
+        else:
+            assert end is not None
+            ranges = self._split_date_range(start, end)
+
+        for chunk_start, chunk_end in ranges:
+            params: list[tuple[str, Any]] = []
+            if chunk_start is not None and chunk_end is not None:
+                params.extend(
+                    (
+                        ("dataInicial", chunk_start.isoformat()),
+                        ("dataFinal", chunk_end.isoformat()),
+                    )
+                )
+            rows.extend(await self._paginate("/caixas", params))
+        return rows
+
+    def _cash_movement_from_row(self, row: dict[str, Any]) -> CashMovement | None:
+        direction = str(
+            self._first_value(row, "debcred", "debCred", "debitoCredito") or ""
+        ).strip().upper()
+        if direction not in {"C", "D"}:
+            logger.warning(
+                "Ignorando lançamento de caixa sem indicador C/D reconhecido: id=%s",
+                row.get("id"),
+            )
+            return None
+
+        amount = abs(self._to_decimal(row.get("valor")))
+        account_id_value = self._first_value(
+            row,
+            "contafinanceira_id",
+            "contaFinanceiraId",
+            "conta_financeira_id",
+        )
+        if account_id_value in (None, ""):
+            account_id_value = self._nested_value(
+                row, ("contaFinanceira", "contafinanceira", "conta_financeira"), "id"
+            )
+
+        account_name_value = self._first_value(
+            row,
+            "contafinanceira_descricao",
+            "contaFinanceiraDescricao",
+            "conta_financeira_descricao",
+        )
+        if account_name_value in (None, ""):
+            account_name_value = self._nested_value(
+                row,
+                ("contaFinanceira", "contafinanceira", "conta_financeira"),
+                "descricao",
+            )
+
+        account_id = str(account_id_value or "sem-conta").strip() or "sem-conta"
+        account_name = str(account_name_value or "Sem conta financeira").strip()
+        movement_id = str(row.get("id") or "").strip()
+        description = str(
+            self._first_value(row, "descricao", "observacoes", "historico") or ""
+        ).strip()
+
+        return CashMovement(
+            id=movement_id,
+            account_id=account_id,
+            account_name=account_name,
+            movement_date=self._parse_api_date(row.get("data")),
+            direction=direction,
+            amount=amount,
+            description=description,
+        )
+
+    async def get_cash_summary(self, *, force_refresh: bool = False) -> CashSummary:
+        """Calculate balances from all movements exposed by GET /caixas.
+
+        Bling's list response contains debit/credit, value, date and financial account.
+        Credits increase the account balance and debits reduce it. The result represents
+        the balance recorded in Bling, not a live balance queried from the bank.
+        """
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._cash_cache is not None
+            and now - self._cash_cache_at < self.CASH_CACHE_SECONDS
+        ):
+            return self._cash_cache
+
+        async with self._cash_cache_lock:
+            now = time.monotonic()
+            if (
+                not force_refresh
+                and self._cash_cache is not None
+                and now - self._cash_cache_at < self.CASH_CACHE_SECONDS
+            ):
+                return self._cash_cache
+
+            rows = await self.list_cash_entries()
+            movements: list[CashMovement] = []
+            buckets: dict[str, dict[str, Any]] = {}
+
+            for row in rows:
+                movement = self._cash_movement_from_row(row)
+                if movement is None:
+                    continue
+                movements.append(movement)
+                bucket = buckets.setdefault(
+                    movement.account_id,
+                    {
+                        "description": movement.account_name,
+                        "credits": Decimal("0"),
+                        "debits": Decimal("0"),
+                        "count": 0,
+                    },
+                )
+                # Prefer a real name if the first row had no account description.
+                if (
+                    bucket["description"] == "Sem conta financeira"
+                    and movement.account_name != "Sem conta financeira"
+                ):
+                    bucket["description"] = movement.account_name
+                if movement.direction == "C":
+                    bucket["credits"] += movement.amount
+                else:
+                    bucket["debits"] += movement.amount
+                bucket["count"] += 1
+
+            accounts = tuple(
+                sorted(
+                    (
+                        CashAccountBalance(
+                            account_id=account_id,
+                            description=str(bucket["description"]),
+                            balance=bucket["credits"] - bucket["debits"],
+                            credits=bucket["credits"],
+                            debits=bucket["debits"],
+                            movement_count=int(bucket["count"]),
+                        )
+                        for account_id, bucket in buckets.items()
+                    ),
+                    key=lambda account: account.description.casefold(),
+                )
+            )
+
+            movements.sort(
+                key=lambda movement: (
+                    movement.movement_date or date.min,
+                    movement.id,
+                ),
+                reverse=True,
+            )
+            summary = CashSummary(accounts=accounts, movements=tuple(movements))
+            self._cash_cache = summary
+            self._cash_cache_at = time.monotonic()
+            return summary
+
+    async def get_cash_account(
+        self,
+        account_id: str,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[CashAccountBalance, tuple[CashMovement, ...]]:
+        summary = await self.get_cash_summary(force_refresh=force_refresh)
+        account = next(
+            (item for item in summary.accounts if item.account_id == str(account_id)),
+            None,
+        )
+        if account is None:
+            raise BlingAPIError("Conta financeira não encontrada nos lançamentos de Caixas e Bancos.")
+        movements = tuple(
+            movement
+            for movement in summary.movements
+            if movement.account_id == account.account_id
+        )
+        return account, movements

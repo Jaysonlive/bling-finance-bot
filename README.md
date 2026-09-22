@@ -180,6 +180,9 @@ Você também pode consultar a conexão com:
 
 ```text
 /status_bling
+/saldos
+/posicao
+/posicao 2026-09-22 2026-12-31
 ```
 
 ou pelo botão **Bling / Conexão** do menu.
@@ -275,6 +278,32 @@ git status
 ```
 
 O arquivo `.env` e `data/bling_tokens.json` **não podem aparecer no commit**.
+
+## Escopo adicional para Caixas e Bancos
+
+Para usar `/saldos` e a **Posição financeira**, o aplicativo cadastrado no Bling precisa ter o escopo de leitura **Caixas e Bancos**.
+
+Se você já tinha autorizado o app antes de adicionar esse escopo:
+
+1. abra o cadastro do aplicativo no Bling;
+2. habilite **Caixas e Bancos** na Lista de escopos;
+3. salve o aplicativo;
+4. no Telegram, envie `/autorizar`;
+5. abra o novo link, autorize e cole a URL completa de retorno no bot.
+
+Apenas renovar o access token antigo não adiciona um novo escopo: é necessário reautorizar depois de alterar as permissões do app.
+
+### Como o saldo é calculado
+
+O endpoint `GET /caixas` retorna os lançamentos com indicador de débito/crédito, valor, data e conta financeira. O bot pagina todo o histórico exposto pela API e calcula, por conta:
+
+```text
+saldo = créditos - débitos
+```
+
+A consulta é mantida em cache em memória por 5 minutos para evitar reler todo o histórico a cada clique. O botão **Atualizar saldos** força uma nova leitura.
+
+Esse valor representa o saldo financeiro **registrado no Bling**. Ele não consulta o internet banking em tempo real. Se o banco tiver movimentações ainda não lançadas/conciliadas no Bling, os valores podem divergir do aplicativo do banco.
 
 ## 8. Deploy no EasyPanel
 
@@ -439,6 +468,7 @@ GET  /Api/v3/contas/receber
 GET  /Api/v3/contas/receber/{id}
 GET  /Api/v3/contas/pagar
 GET  /Api/v3/contas/pagar/{id}
+GET  /Api/v3/caixas
 ```
 
 Base atual:
@@ -499,4 +529,4 @@ O relatório deste projeto responde à pergunta operacional:
 
 > Quanto tenho para receber menos quanto tenho para pagar, considerando os vencimentos pendentes dentro deste período?
 
-Ele não substitui o extrato realizado de Caixas e Bancos nem uma DRE. Se futuramente você quiser, é possível adicionar em outro módulo uma visão separada de **realizado x previsto**, preservando este relatório atual como projeção de caixa.
+O relatório de títulos não substitui uma DRE. A versão atual também possui uma visão de **Caixas e Bancos** baseada nos lançamentos realizados expostos pela API e uma **Posição financeira** que combina o saldo registrado com o fluxo futuro de contas a receber e pagar.
