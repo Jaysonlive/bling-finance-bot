@@ -538,7 +538,11 @@ def _cash_scope_message(exc: BlingAuthError) -> str:
 
 
 def _cash_summary_text(summary) -> str:
-    lines = ["💳 Saldos — Caixas e Bancos", ""]
+    lines = [
+        "💳 Saldos — Caixas e Bancos",
+        f"📅 Posição até {summary.as_of.strftime('%d/%m/%Y')}",
+        "",
+    ]
     if not summary.accounts:
         lines.append("Nenhum lançamento financeiro foi retornado pelo Bling.")
     else:
@@ -547,10 +551,11 @@ def _cash_summary_text(summary) -> str:
         lines.extend(
             [
                 "",
-                f"💵 Total registrado no Bling: {format_brl(summary.total_balance)}",
+                f"💵 Saldo total reconstruído: {format_brl(summary.total_balance)}",
                 "",
-                "ℹ️ Saldo calculado pelos lançamentos de Caixas e Bancos. "
-                "Não é consulta em tempo real ao internet banking.",
+                f"ℹ️ O saldo é reconstruído pelo histórico de Caixas e Bancos desde "
+                f"{summary.history_start.strftime('%d/%m/%Y')}, em vez de somar somente "
+                "o movimento do mês atual. Não é consulta em tempo real ao internet banking.",
             ]
         )
     return "\n".join(lines)
@@ -564,10 +569,12 @@ async def _send_cash_summary(
     force_refresh: bool,
 ) -> None:
     bling: BlingClient = context.application.bot_data["bling"]
+    tz: ZoneInfo = context.application.bot_data["timezone"]
+    today = datetime.now(tz).date()
     auth_error = False
     accounts: tuple = ()
     try:
-        summary = await bling.get_cash_summary(force_refresh=force_refresh)
+        summary = await bling.get_cash_summary(today, force_refresh=force_refresh)
         text = _cash_summary_text(summary)
         accounts = summary.accounts
     except BlingAuthError as exc:
@@ -605,7 +612,7 @@ async def _send_cash_account(
 
     try:
         account, movements = await bling.get_cash_account(
-            account_id, force_refresh=force_refresh
+            account_id, today, force_refresh=force_refresh
         )
         month_movements = [
             movement
@@ -619,15 +626,18 @@ async def _send_cash_account(
         month_debits = sum(
             (m.amount for m in month_movements if m.direction == "D"), Decimal("0")
         )
+        month_net = month_credits - month_debits
+        opening_month_balance = account.balance - month_net
         lines = [
             f"🏦 {account.description}",
             "",
-            f"Saldo registrado: {format_brl(account.balance)}",
+            f"💳 Saldo atual reconstruído: {format_brl(account.balance)}",
             "",
+            f"Saldo no início do mês: {format_brl(opening_month_balance)}",
             f"Entradas no mês: {format_brl(month_credits)}",
             f"Saídas no mês: {format_brl(month_debits)}",
-            f"Movimento líquido no mês: {format_brl(month_credits - month_debits)}",
-            f"Lançamentos históricos: {account.movement_count}",
+            f"Movimento líquido no mês: {format_brl(month_net)}",
+            f"Lançamentos no histórico: {account.movement_count}",
         ]
         recent = list(movements[:8])
         if recent:
@@ -667,24 +677,26 @@ async def _send_financial_position(
     edit: bool,
 ) -> None:
     bling: BlingClient = context.application.bot_data["bling"]
+    tz: ZoneInfo = context.application.bot_data["timezone"]
+    today = datetime.now(tz).date()
     auth_error = False
     try:
-        cash = await bling.get_cash_summary()
+        cash = await bling.get_cash_summary(today)
         flow = await bling.get_financial_summary(start, end)
         projected = cash.total_balance + flow.net
         signal = "🟢" if projected >= 0 else "🔴"
         text = (
             "💼 Posição financeira\n"
             f"📅 Projeção: {format_period(start, end)}\n\n"
-            f"💳 Saldo atual no Bling: {format_brl(cash.total_balance)}\n"
+            f"💳 Saldo atual reconstruído: {format_brl(cash.total_balance)}\n"
             f"💰 A receber no período: {format_brl(flow.receivable.total)} "
             f"({flow.receivable.count} títulos)\n"
             f"💸 A pagar no período: {format_brl(flow.payable.total)} "
             f"({flow.payable.count} títulos)\n"
             f"📊 Movimento futuro líquido: {format_brl(flow.net)}\n\n"
             f"{signal} Saldo projetado: {format_brl(projected)}\n\n"
-            "ℹ️ Saldo atual = lançamentos registrados em Caixas e Bancos; "
-            "não é saldo bancário em tempo real."
+            f"ℹ️ Saldo atual reconstruído pelo histórico de Caixas e Bancos desde "
+            f"{cash.history_start.strftime('%d/%m/%Y')}; não é saldo bancário em tempo real."
         )
     except BlingAuthError as exc:
         logger.warning("Sem autorização ao calcular posição financeira: %s", exc)
@@ -721,14 +733,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data == "cash:menu":
         await query.edit_message_text(
-            "⏳ Consultando saldos de Caixas e Bancos...\n"
-            "A primeira consulta pode levar alguns segundos."
+            "⏳ Reconstruindo os saldos de Caixas e Bancos...\n"
+            "Na primeira consulta o bot percorre o histórico para incluir o saldo inicial."
         )
         await _send_cash_summary(update, context, edit=True, force_refresh=False)
         return
 
     if data == "cash:refresh":
-        await query.edit_message_text("⏳ Atualizando saldos de Caixas e Bancos...")
+        await query.edit_message_text(
+            "⏳ Atualizando saldos de Caixas e Bancos...\n"
+            "Recalculando pelo histórico completo."
+        )
         await _send_cash_summary(update, context, edit=True, force_refresh=True)
         return
 
@@ -944,6 +959,7 @@ def main() -> None:
         client_id=settings.bling_client_id,
         client_secret=settings.bling_client_secret,
         token_file=settings.bling_token_file,
+        cash_history_start=settings.cash_history_start,
     )
 
     application = (

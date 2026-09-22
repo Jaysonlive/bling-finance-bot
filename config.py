@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import FrozenSet
 
@@ -17,6 +18,13 @@ def _require(name: str) -> str:
     if not value:
         raise ConfigError(f"Variável de ambiente obrigatória ausente: {name}")
     return value
+
+
+def _parse_iso_date(name: str, raw: str) -> date:
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} deve estar no formato YYYY-MM-DD.") from exc
 
 
 def _parse_allowed_users(raw: str) -> FrozenSet[int]:
@@ -50,6 +58,7 @@ class Settings:
     bling_client_secret: str
     allowed_users: FrozenSet[int]
     bling_token_file: Path
+    cash_history_start: date
     timezone: str
     log_level: str
 
@@ -67,6 +76,10 @@ class Settings:
             bling_client_secret=_require("BLING_CLIENT_SECRET"),
             allowed_users=_parse_allowed_users(_require("ALLOWED_USERS")),
             bling_token_file=token_file,
+            cash_history_start=_parse_iso_date(
+                "CASH_HISTORY_START",
+                os.getenv("CASH_HISTORY_START", "2000-01-01").strip() or "2000-01-01",
+            ),
             timezone=os.getenv("TZ", "America/Sao_Paulo").strip() or "America/Sao_Paulo",
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         )

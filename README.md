@@ -135,6 +135,7 @@ BLING_CLIENT_ID=CLIENT_ID_REAL_DO_BLING
 BLING_CLIENT_SECRET=CLIENT_SECRET_REAL_DO_BLING
 ALLOWED_USERS=123456789
 BLING_TOKEN_FILE=/app/data/bling_tokens.json
+CASH_HISTORY_START=2000-01-01
 TZ=America/Sao_Paulo
 LOG_LEVEL=INFO
 ```
@@ -254,6 +255,8 @@ Comandos disponíveis:
 /fluxo 2026-01-01 2026-12-31
 /autorizar      gera o link OAuth do Bling no Telegram
 /status_bling   mostra o status da conexão
+/saldos         saldo reconstruído de Caixas e Bancos
+/posicao        saldo atual + contas a receber - contas a pagar
 ```
 
 Teste primeiro períodos curtos, por exemplo "Hoje". Depois teste mês e ano.
@@ -293,17 +296,36 @@ Se você já tinha autorizado o app antes de adicionar esse escopo:
 
 Apenas renovar o access token antigo não adiciona um novo escopo: é necessário reautorizar depois de alterar as permissões do app.
 
-### Como o saldo é calculado
+### Como o saldo é calculado — importante
 
-O endpoint `GET /caixas` retorna os lançamentos com indicador de débito/crédito, valor, data e conta financeira. O bot pagina todo o histórico exposto pela API e calcula, por conta:
+Não use `GET /caixas` sem datas para calcular saldo. O período padrão desse endpoint pode representar somente a janela atual exibida pelo Bling. Somar apenas essa janela produz **movimento líquido do período**, e não necessariamente o saldo da conta.
+
+Nesta versão o bot sempre informa `dataInicial` e `dataFinal` e reconstrói o saldo desde `CASH_HISTORY_START` até a data atual. A API do Bling limita filtros de período a no máximo um ano, então o cliente quebra automaticamente o histórico em blocos seguros e pagina cada bloco de 100 em 100 registros.
+
+A fórmula passa a ser:
 
 ```text
-saldo = créditos - débitos
+saldo atual reconstruído
+= créditos históricos que entraram no Caixa/Bancos
+- débitos históricos que saíram do Caixa/Bancos
 ```
 
-A consulta é mantida em cache em memória por 5 minutos para evitar reler todo o histórico a cada clique. O botão **Atualizar saldos** força uma nova leitura.
+O saldo inicial cadastrado na conta precisa estar dentro do histórico consultado. Por isso `CASH_HISTORY_START` deve ser uma data **anterior à criação da conta financeira mais antiga**. O padrão é `2000-01-01`, que normalmente dispensa configuração adicional.
 
-Esse valor representa o saldo financeiro **registrado no Bling**. Ele não consulta o internet banking em tempo real. Se o banco tiver movimentações ainda não lançadas/conciliadas no Bling, os valores podem divergir do aplicativo do banco.
+No detalhe de cada conta o bot também separa:
+
+```text
+saldo no início do mês
++ entradas do mês
+- saídas do mês
+= saldo atual reconstruído
+```
+
+Isso evita confundir, por exemplo, um movimento líquido mensal de R$ 293,14 com um saldo atual de R$ 377,14 quando já existia R$ 84,00 antes do mês.
+
+A consulta é mantida em cache em memória por 5 minutos para evitar reler todo o histórico a cada clique. O botão **Atualizar saldos** força uma nova leitura. A primeira consulta pode levar alguns segundos porque percorre o histórico completo.
+
+Esse valor representa o saldo financeiro reconstruído a partir dos lançamentos **registrados no Bling**. Ele não consulta o internet banking em tempo real. Se houver movimentações no banco que ainda não estejam registradas/conciliadas no Bling, os valores podem divergir do aplicativo bancário.
 
 ## 8. Deploy no EasyPanel
 
@@ -333,6 +355,7 @@ BLING_CLIENT_ID=...
 BLING_CLIENT_SECRET=...
 ALLOWED_USERS=123456789
 BLING_TOKEN_FILE=/app/data/bling_tokens.json
+CASH_HISTORY_START=2000-01-01
 TZ=America/Sao_Paulo
 LOG_LEVEL=INFO
 ```
@@ -529,4 +552,4 @@ O relatório deste projeto responde à pergunta operacional:
 
 > Quanto tenho para receber menos quanto tenho para pagar, considerando os vencimentos pendentes dentro deste período?
 
-O relatório de títulos não substitui uma DRE. A versão atual também possui uma visão de **Caixas e Bancos** baseada nos lançamentos realizados expostos pela API e uma **Posição financeira** que combina o saldo registrado com o fluxo futuro de contas a receber e pagar.
+O relatório de títulos não substitui uma DRE. A versão atual também possui uma visão de **Caixas e Bancos** que reconstrói o saldo usando o histórico explícito de lançamentos e uma **Posição financeira** que combina esse saldo com o fluxo futuro de contas a receber e pagar.

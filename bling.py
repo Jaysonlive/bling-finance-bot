@@ -96,6 +96,8 @@ class CashAccountBalance:
 
 @dataclass(frozen=True, slots=True)
 class CashSummary:
+    history_start: date
+    as_of: date
     accounts: tuple[CashAccountBalance, ...]
     movements: tuple[CashMovement, ...]
 
@@ -136,16 +138,19 @@ class BlingClient:
         client_secret: str,
         token_file: str | Path,
         *,
+        cash_history_start: date = date(2000, 1, 1),
         timeout_seconds: float = 30.0,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.token_file = Path(token_file)
+        self.cash_history_start = cash_history_start
         self._tokens: TokenData | None = None
         self._token_lock = asyncio.Lock()
         self._rate_lock = asyncio.Lock()
         self._last_request_at = 0.0
         self._cash_cache: CashSummary | None = None
+        self._cash_cache_key: tuple[date, date] | None = None
         self._cash_cache_at = 0.0
         self._cash_cache_lock = asyncio.Lock()
         self._http = httpx.AsyncClient(
@@ -155,7 +160,7 @@ class BlingClient:
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "enable-jwt": "1",
-                "User-Agent": "bling-finance-telegram-bot/1.0",
+                "User-Agent": "bling-finance-telegram-bot/1.1",
             },
         )
 
@@ -617,39 +622,30 @@ class BlingClient:
 
     async def list_cash_entries(
         self,
-        start: date | None = None,
-        end: date | None = None,
+        start: date,
+        end: date,
     ) -> list[dict[str, Any]]:
-        """List Caixas e Bancos movements using Bling's paginated GET /caixas.
+        """List Caixas e Bancos movements for an explicit date range.
 
-        With no dates, Bling returns the account history page by page. Date filters are
-        used only when both bounds are provided. Current Bling versions accept ISO
-        YYYY-MM-DD for dataInicial/dataFinal.
+        The Bling endpoint has a UI-oriented default period when dates are omitted.
+        Because that default is not the account's complete history, balance calculations
+        MUST always use explicit dataInicial/dataFinal filters. Ranges longer than one
+        year are split automatically to respect the API limit.
         """
-        if (start is None) != (end is None):
-            raise ValueError("Informe data inicial e final juntas.")
-        if start is not None and end is not None and end < start:
+        if end < start:
             raise ValueError("A data final não pode ser anterior à data inicial.")
 
         rows: list[dict[str, Any]] = []
-        ranges: Iterable[tuple[date | None, date | None]]
-        if start is None:
-            ranges = ((None, None),)
-        else:
-            assert end is not None
-            ranges = self._split_date_range(start, end)
-
-        for chunk_start, chunk_end in ranges:
-            params: list[tuple[str, Any]] = []
-            if chunk_start is not None and chunk_end is not None:
-                params.extend(
-                    (
-                        ("dataInicial", chunk_start.isoformat()),
-                        ("dataFinal", chunk_end.isoformat()),
-                    )
-                )
+        for chunk_start, chunk_end in self._split_date_range(start, end):
+            params: list[tuple[str, Any]] = [
+                ("dataInicial", chunk_start.isoformat()),
+                ("dataFinal", chunk_end.isoformat()),
+            ]
             rows.extend(await self._paginate("/caixas", params))
-        return rows
+
+        # IDs are stable across pages/ranges. Deduplication also protects against
+        # records moving between pages while Bling is being updated concurrently.
+        return self._deduplicate(rows)
 
     def _cash_movement_from_row(self, row: dict[str, Any]) -> CashMovement | None:
         direction = str(
@@ -704,17 +700,34 @@ class BlingClient:
             description=description,
         )
 
-    async def get_cash_summary(self, *, force_refresh: bool = False) -> CashSummary:
-        """Calculate balances from all movements exposed by GET /caixas.
+    async def get_cash_summary(
+        self,
+        as_of: date,
+        *,
+        force_refresh: bool = False,
+    ) -> CashSummary:
+        """Reconstruct current balances from the complete Caixas e Bancos history.
 
-        Bling's list response contains debit/credit, value, date and financial account.
-        Credits increase the account balance and debits reduce it. The result represents
-        the balance recorded in Bling, not a live balance queried from the bank.
+        Important: GET /caixas without dates behaves like the Bling screen/export and
+        returns a limited/default period (for example, the current month). Summing that
+        period gives *movement in the period*, not the current account balance.
+
+        To reconcile with Bling's displayed balance we explicitly fetch every movement
+        from ``cash_history_start`` through ``as_of``. Bling models the initial balance
+        as a Caixas e Bancos launch, so it is included when the configured start date is
+        earlier than the account's "data de início dos lançamentos".
         """
+        if as_of < self.cash_history_start:
+            raise ValueError(
+                "A data do saldo não pode ser anterior ao início do histórico configurado."
+            )
+
+        cache_key = (self.cash_history_start, as_of)
         now = time.monotonic()
         if (
             not force_refresh
             and self._cash_cache is not None
+            and self._cash_cache_key == cache_key
             and now - self._cash_cache_at < self.CASH_CACHE_SECONDS
         ):
             return self._cash_cache
@@ -724,11 +737,38 @@ class BlingClient:
             if (
                 not force_refresh
                 and self._cash_cache is not None
+                and self._cash_cache_key == cache_key
                 and now - self._cash_cache_at < self.CASH_CACHE_SECONDS
             ):
                 return self._cash_cache
 
-            rows = await self.list_cash_entries()
+            logger.info(
+                "Reconstruindo Caixas e Bancos de %s até %s",
+                self.cash_history_start.isoformat(),
+                as_of.isoformat(),
+            )
+            rows = await self.list_cash_entries(self.cash_history_start, as_of)
+
+            # Re-read the current month with an explicit narrow range and replace the
+            # same dates from the long-history result. Besides making the monthly
+            # numbers directly comparable with Bling's export, this protects against
+            # records moving between pages while the large historical pagination runs.
+            month_start = date(as_of.year, as_of.month, 1)
+            current_month_rows = await self.list_cash_entries(month_start, as_of)
+            historical_before_month = [
+                row
+                for row in rows
+                if (parsed := self._parse_api_date(row.get("data"))) is None
+                or parsed < month_start
+                or parsed > as_of
+            ]
+            rows = self._deduplicate(historical_before_month + current_month_rows)
+            logger.info(
+                "Caixas e Bancos carregado: %d lançamentos históricos; %d no mês atual",
+                len(rows),
+                len(current_month_rows),
+            )
+
             movements: list[CashMovement] = []
             buckets: dict[str, dict[str, Any]] = {}
 
@@ -746,7 +786,6 @@ class BlingClient:
                         "count": 0,
                     },
                 )
-                # Prefer a real name if the first row had no account description.
                 if (
                     bucket["description"] == "Sem conta financeira"
                     and movement.account_name != "Sem conta financeira"
@@ -782,18 +821,25 @@ class BlingClient:
                 ),
                 reverse=True,
             )
-            summary = CashSummary(accounts=accounts, movements=tuple(movements))
+            summary = CashSummary(
+                history_start=self.cash_history_start,
+                as_of=as_of,
+                accounts=accounts,
+                movements=tuple(movements),
+            )
             self._cash_cache = summary
+            self._cash_cache_key = cache_key
             self._cash_cache_at = time.monotonic()
             return summary
 
     async def get_cash_account(
         self,
         account_id: str,
+        as_of: date,
         *,
         force_refresh: bool = False,
     ) -> tuple[CashAccountBalance, tuple[CashMovement, ...]]:
-        summary = await self.get_cash_summary(force_refresh=force_refresh)
+        summary = await self.get_cash_summary(as_of, force_refresh=force_refresh)
         account = next(
             (item for item in summary.accounts if item.account_id == str(account_id)),
             None,
