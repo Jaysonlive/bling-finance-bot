@@ -153,6 +153,14 @@ class BlingClient:
         self._cash_cache_key: tuple[date, date] | None = None
         self._cash_cache_at = 0.0
         self._cash_cache_lock = asyncio.Lock()
+        # Persistent cache for individual /caixas/{id} details. The list endpoint
+        # does not expose the crucial flags ``saldo`` (affects balance) and
+        # ``situacao`` (regular/excluded), so an accurate balance requires the
+        # detail endpoint. Persisting old details makes the first sync the only
+        # expensive one and survives container rebuilds via /app/data.
+        self._cash_detail_cache_file = self.token_file.parent / "bling_cash_details.json"
+        self._cash_detail_cache: dict[str, dict[str, Any]] | None = None
+        self._cash_detail_cache_lock = asyncio.Lock()
         self._http = httpx.AsyncClient(
             base_url=self.API_BASE_URL,
             timeout=httpx.Timeout(timeout_seconds),
@@ -160,7 +168,7 @@ class BlingClient:
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "enable-jwt": "1",
-                "User-Agent": "bling-finance-telegram-bot/1.1",
+                "User-Agent": "bling-finance-telegram-bot/1.2",
             },
         )
 
@@ -620,18 +628,73 @@ class BlingClient:
         except ValueError:
             return None
 
+    def _cash_account_id_from_row(self, row: dict[str, Any]) -> str:
+        account_id_value = self._first_value(
+            row,
+            "contafinanceira_id",
+            "contaFinanceiraId",
+            "conta_financeira_id",
+        )
+        if account_id_value in (None, ""):
+            account_id_value = self._nested_value(
+                row, ("contaFinanceira", "contafinanceira", "conta_financeira"), "id"
+            )
+        return str(account_id_value or "").strip()
+
+    def _cash_account_name_from_row(self, row: dict[str, Any]) -> str:
+        account_name_value = self._first_value(
+            row,
+            "contafinanceira_descricao",
+            "contaFinanceiraDescricao",
+            "conta_financeira_descricao",
+        )
+        if account_name_value in (None, ""):
+            account_name_value = self._nested_value(
+                row,
+                ("contaFinanceira", "contafinanceira", "conta_financeira"),
+                "descricao",
+            )
+        return str(account_name_value or "Sem conta financeira").strip()
+
+    async def list_financial_accounts(self) -> dict[str, str]:
+        """Return the current financial-account catalog from /contas-contabeis.
+
+        Bling allows old accounts to be inactivated in the UI. Reconstructing the
+        list of accounts from historical /caixas movements therefore resurrects
+        accounts that no longer exist in today's sidebar. The account catalog is
+        used as the authoritative set of current IDs.
+
+        Some apps may not have the ``Contas Contábeis`` scope. In that case we
+        return an empty dict and the caller falls back to recently used account
+        IDs from Caixas e Bancos instead of failing the whole feature.
+        """
+        try:
+            rows = await self._paginate(
+                "/contas-contabeis",
+                [("ordenacao", "descricao")],
+            )
+        except BlingAuthError as exc:
+            if "403" in str(exc):
+                logger.warning(
+                    "Sem escopo de Contas Contábeis; usando descoberta por Caixas e Bancos."
+                )
+                return {}
+            raise
+
+        result: dict[str, str] = {}
+        for row in rows:
+            account_id = str(row.get("id") or "").strip()
+            description = str(row.get("descricao") or "").strip()
+            if account_id and description:
+                result[account_id] = description
+        return result
+
     async def list_cash_entries(
         self,
         start: date,
         end: date,
     ) -> list[dict[str, Any]]:
-        """List Caixas e Bancos movements for an explicit date range.
-
-        The Bling endpoint has a UI-oriented default period when dates are omitted.
-        Because that default is not the account's complete history, balance calculations
-        MUST always use explicit dataInicial/dataFinal filters. Ranges longer than one
-        year are split automatically to respect the API limit.
-        """
+        """List Caixas e Bancos movements for an explicit date range."""
         if end < start:
             raise ValueError("A data final não pode ser anterior à data inicial.")
 
@@ -642,10 +705,161 @@ class BlingClient:
                 ("dataFinal", chunk_end.isoformat()),
             ]
             rows.extend(await self._paginate("/caixas", params))
-
-        # IDs are stable across pages/ranges. Deduplication also protects against
-        # records moving between pages while Bling is being updated concurrently.
         return self._deduplicate(rows)
+
+    async def _discover_current_cash_accounts(
+        self,
+        as_of: date,
+    ) -> dict[str, str]:
+        """Resolve the financial-account IDs that belong to the current setup.
+
+        The important rule is: *never* infer the current account list by scanning
+        old /caixas history. Doing that resurrects accounts that were used years
+        ago and later removed/inactivated (exactly what happened in v4).
+
+        Preferred source is /contas-contabeis, the current financial-account
+        catalog exposed by Bling. If that scope is unavailable, fall back to
+        account IDs actually seen in the current month, deduplicating equal names
+        by the most recent movement. The fallback is intentionally conservative:
+        it is better to omit an old/inactive account than to invent a current one.
+        """
+        catalog = await self.list_financial_accounts()
+        if catalog:
+            logger.info(
+                "Contas financeiras atuais via /contas-contabeis (%d): %s",
+                len(catalog),
+                ", ".join(catalog.values()),
+            )
+            return catalog
+
+        month_start = date(as_of.year, as_of.month, 1)
+        recent = await self.list_cash_entries(month_start, as_of)
+
+        # name(casefold) -> (account_id, movement_date, movement_id, display_name)
+        chosen: dict[str, tuple[str, date, str, str]] = {}
+        for row in recent:
+            account_id = self._cash_account_id_from_row(row)
+            if not account_id:
+                continue
+            display_name = self._cash_account_name_from_row(row)
+            key = display_name.casefold().strip()
+            row_date = self._parse_api_date(row.get("data")) or date.min
+            row_id = str(row.get("id") or "")
+            existing = chosen.get(key)
+            if existing is None or (row_date, row_id) > (existing[1], existing[2]):
+                chosen[key] = (account_id, row_date, row_id, display_name)
+
+        result = {
+            account_id: display_name
+            for account_id, _, __, display_name in chosen.values()
+        }
+        logger.info(
+            "Contas financeiras atuais por fallback do mês (%d): %s",
+            len(result),
+            ", ".join(result.values()),
+        )
+        return result
+
+    def _read_cash_detail_cache_sync(self) -> dict[str, dict[str, Any]]:
+        if not self._cash_detail_cache_file.exists():
+            return {}
+        try:
+            with self._cash_detail_cache_file.open("r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+            if not isinstance(payload, dict):
+                return {}
+            items = payload.get("items", payload)
+            if not isinstance(items, dict):
+                return {}
+            return {
+                str(key): value
+                for key, value in items.items()
+                if isinstance(value, dict)
+            }
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Cache de detalhes de Caixas e Bancos inválido; recriando.")
+            return {}
+
+    def _save_cash_detail_cache_sync(self, items: dict[str, dict[str, Any]]) -> None:
+        self._cash_detail_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._cash_detail_cache_file.with_suffix(".json.tmp")
+        payload = {"version": 1, "items": items}
+        try:
+            with tmp.open("w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False, separators=(",", ":"))
+                fp.flush()
+                os.fsync(fp.fileno())
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, self._cash_detail_cache_file)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    async def _ensure_cash_detail_cache(self) -> dict[str, dict[str, Any]]:
+        if self._cash_detail_cache is None:
+            async with self._cash_detail_cache_lock:
+                if self._cash_detail_cache is None:
+                    self._cash_detail_cache = await asyncio.to_thread(
+                        self._read_cash_detail_cache_sync
+                    )
+        assert self._cash_detail_cache is not None
+        return self._cash_detail_cache
+
+    async def _persist_cash_detail_cache(self) -> None:
+        cache = await self._ensure_cash_detail_cache()
+        async with self._cash_detail_cache_lock:
+            await asyncio.to_thread(self._save_cash_detail_cache_sync, cache)
+
+    async def _get_cash_entry_detail(self, entry_id: str) -> dict[str, Any]:
+        payload = await self._request("GET", f"/caixas/{entry_id}")
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise BlingAPIError(
+                f"Detalhe do lançamento de Caixas e Bancos {entry_id} em formato inesperado."
+            )
+        return data
+
+    async def _cash_detail_for_row(
+        self,
+        row: dict[str, Any],
+        *,
+        as_of: date,
+        force_refresh: bool,
+    ) -> dict[str, Any]:
+        """Return row details, using a persistent cache for historical records."""
+        # Future-proofing: if Bling starts returning these fields in the list route,
+        # no extra request is necessary.
+        if str(row.get("saldo") or "").upper() in {"S", "N"} and str(
+            row.get("situacao") or ""
+        ).upper() in {"R", "E"}:
+            return row
+
+        entry_id = str(row.get("id") or "").strip()
+        if not entry_id:
+            raise BlingAPIError("Lançamento de Caixas e Bancos retornado sem ID.")
+
+        cache = await self._ensure_cash_detail_cache()
+        cached = cache.get(entry_id)
+        movement_date = self._parse_api_date(row.get("data"))
+        month_start = date(as_of.year, as_of.month, 1)
+        is_current_month = movement_date is None or movement_date >= month_start
+        max_age = self.CASH_CACHE_SECONDS if is_current_month else 3650 * 24 * 3600
+
+        if cached and not force_refresh:
+            cached_at = float(cached.get("cached_at", 0) or 0)
+            data = cached.get("data")
+            if isinstance(data, dict) and time.time() - cached_at < max_age:
+                return data
+
+        detail = await self._get_cash_entry_detail(entry_id)
+        cache[entry_id] = {"cached_at": time.time(), "data": detail}
+        return detail
 
     def _cash_movement_from_row(self, row: dict[str, Any]) -> CashMovement | None:
         direction = str(
@@ -659,32 +873,8 @@ class BlingClient:
             return None
 
         amount = abs(self._to_decimal(row.get("valor")))
-        account_id_value = self._first_value(
-            row,
-            "contafinanceira_id",
-            "contaFinanceiraId",
-            "conta_financeira_id",
-        )
-        if account_id_value in (None, ""):
-            account_id_value = self._nested_value(
-                row, ("contaFinanceira", "contafinanceira", "conta_financeira"), "id"
-            )
-
-        account_name_value = self._first_value(
-            row,
-            "contafinanceira_descricao",
-            "contaFinanceiraDescricao",
-            "conta_financeira_descricao",
-        )
-        if account_name_value in (None, ""):
-            account_name_value = self._nested_value(
-                row,
-                ("contaFinanceira", "contafinanceira", "conta_financeira"),
-                "descricao",
-            )
-
-        account_id = str(account_id_value or "sem-conta").strip() or "sem-conta"
-        account_name = str(account_name_value or "Sem conta financeira").strip()
+        account_id = self._cash_account_id_from_row(row) or "sem-conta"
+        account_name = self._cash_account_name_from_row(row)
         movement_id = str(row.get("id") or "").strip()
         description = str(
             self._first_value(row, "descricao", "observacoes", "historico") or ""
@@ -706,16 +896,16 @@ class BlingClient:
         *,
         force_refresh: bool = False,
     ) -> CashSummary:
-        """Reconstruct current balances from the complete Caixas e Bancos history.
+        """Build balances using only current accounts and balance-affecting records.
 
-        Important: GET /caixas without dates behaves like the Bling screen/export and
-        returns a limited/default period (for example, the current month). Summing that
-        period gives *movement in the period*, not the current account balance.
+        Two details are essential for matching the Bling sidebar:
+        * historical accounts that were later inactivated must not be resurrected;
+        * a Caixas e Bancos row may exist for reporting but have ``saldo=N`` or be
+          excluded (``situacao=E``), in which case it must not change the balance.
 
-        To reconcile with Bling's displayed balance we explicitly fetch every movement
-        from ``cash_history_start`` through ``as_of``. Bling models the initial balance
-        as a Caixas e Bancos launch, so it is included when the configured start date is
-        earlier than the account's "data de início dos lançamentos".
+        The list endpoint does not expose those flags, so the detail endpoint is
+        consulted and cached persistently. This is deliberately more conservative
+        than simply summing every historical debit and credit.
         """
         if as_of < self.cash_history_start:
             raise ValueError(
@@ -742,60 +932,115 @@ class BlingClient:
             ):
                 return self._cash_cache
 
+            current_accounts = await self._discover_current_cash_accounts(as_of)
+            if not current_accounts:
+                return CashSummary(
+                    history_start=self.cash_history_start,
+                    as_of=as_of,
+                    accounts=(),
+                    movements=(),
+                )
+
             logger.info(
-                "Reconstruindo Caixas e Bancos de %s até %s",
+                "Sincronizando saldos exatos de %d contas atuais desde %s até %s",
+                len(current_accounts),
                 self.cash_history_start.isoformat(),
                 as_of.isoformat(),
             )
             rows = await self.list_cash_entries(self.cash_history_start, as_of)
-
-            # Re-read the current month with an explicit narrow range and replace the
-            # same dates from the long-history result. Besides making the monthly
-            # numbers directly comparable with Bling's export, this protects against
-            # records moving between pages while the large historical pagination runs.
-            month_start = date(as_of.year, as_of.month, 1)
-            current_month_rows = await self.list_cash_entries(month_start, as_of)
-            historical_before_month = [
+            rows = [
                 row
                 for row in rows
-                if (parsed := self._parse_api_date(row.get("data"))) is None
-                or parsed < month_start
-                or parsed > as_of
+                if self._cash_account_id_from_row(row) in current_accounts
             ]
-            rows = self._deduplicate(historical_before_month + current_month_rows)
             logger.info(
-                "Caixas e Bancos carregado: %d lançamentos históricos; %d no mês atual",
-                len(rows),
-                len(current_month_rows),
+                "%d lançamentos pertencem às contas financeiras atuais.", len(rows)
             )
 
             movements: list[CashMovement] = []
-            buckets: dict[str, dict[str, Any]] = {}
+            buckets: dict[str, dict[str, Any]] = {
+                account_id: {
+                    "description": description,
+                    "credits": Decimal("0"),
+                    "debits": Decimal("0"),
+                    "count": 0,
+                }
+                for account_id, description in current_accounts.items()
+            }
 
-            for row in rows:
-                movement = self._cash_movement_from_row(row)
+            dirty_cache = False
+            fetched_since_save = 0
+            accepted = 0
+            skipped_no_balance = 0
+            skipped_excluded = 0
+
+            for index, row in enumerate(rows, start=1):
+                entry_id = str(row.get("id") or "").strip()
+                detail = await self._cash_detail_for_row(
+                    row,
+                    as_of=as_of,
+                    force_refresh=force_refresh and (
+                        (self._parse_api_date(row.get("data")) or as_of)
+                        >= date(as_of.year, as_of.month, 1)
+                    ),
+                )
+                if entry_id:
+                    dirty_cache = True
+                    fetched_since_save += 1
+
+                saldo_flag = str(detail.get("saldo") or "S").strip().upper()
+                situacao = str(detail.get("situacao") or "R").strip().upper()
+                if saldo_flag == "N":
+                    skipped_no_balance += 1
+                    continue
+                if situacao == "E":
+                    skipped_excluded += 1
+                    continue
+
+                # The detail response has the authoritative financial flags while
+                # the list response is often richer for account description. Merge
+                # them so parsing is resilient across API versions.
+                merged = dict(row)
+                merged.update(detail)
+                if not self._cash_account_id_from_row(merged):
+                    merged.update({
+                        "contafinanceira_id": self._cash_account_id_from_row(row),
+                        "contafinanceira_descricao": self._cash_account_name_from_row(row),
+                    })
+                movement = self._cash_movement_from_row(merged)
                 if movement is None:
                     continue
+                if movement.account_id not in current_accounts:
+                    continue
+
+                accepted += 1
                 movements.append(movement)
-                bucket = buckets.setdefault(
-                    movement.account_id,
-                    {
-                        "description": movement.account_name,
-                        "credits": Decimal("0"),
-                        "debits": Decimal("0"),
-                        "count": 0,
-                    },
-                )
-                if (
-                    bucket["description"] == "Sem conta financeira"
-                    and movement.account_name != "Sem conta financeira"
-                ):
-                    bucket["description"] = movement.account_name
+                bucket = buckets[movement.account_id]
                 if movement.direction == "C":
                     bucket["credits"] += movement.amount
                 else:
                     bucket["debits"] += movement.amount
                 bucket["count"] += 1
+
+                if fetched_since_save >= 25:
+                    await self._persist_cash_detail_cache()
+                    fetched_since_save = 0
+                    logger.info(
+                        "Sincronização Caixas e Bancos: %d/%d lançamentos processados",
+                        index,
+                        len(rows),
+                    )
+
+            if dirty_cache:
+                await self._persist_cash_detail_cache()
+
+            logger.info(
+                "Caixas e Bancos: %d lançamentos válidos; %d sem efeito no saldo; "
+                "%d excluídos.",
+                accepted,
+                skipped_no_balance,
+                skipped_excluded,
+            )
 
             accounts = tuple(
                 sorted(
@@ -845,10 +1090,11 @@ class BlingClient:
             None,
         )
         if account is None:
-            raise BlingAPIError("Conta financeira não encontrada nos lançamentos de Caixas e Bancos.")
+            raise BlingAPIError("Conta financeira atual não encontrada em Caixas e Bancos.")
         movements = tuple(
             movement
             for movement in summary.movements
             if movement.account_id == account.account_id
         )
         return account, movements
+

@@ -96,6 +96,8 @@ No painel/desenvolvedor do Bling, crie um aplicativo OAuth e habilite os escopos
 
 - Contas a Receber
 - Contas a Pagar
+- Caixas e Bancos
+- Contas Contábeis
 
 No cadastro do aplicativo, configure também a URL de redirecionamento solicitada pelo Bling.
 
@@ -255,7 +257,7 @@ Comandos disponíveis:
 /fluxo 2026-01-01 2026-12-31
 /autorizar      gera o link OAuth do Bling no Telegram
 /status_bling   mostra o status da conexão
-/saldos         saldo reconstruído de Caixas e Bancos
+/saldos         saldos das contas financeiras atuais do Bling
 /posicao        saldo atual + contas a receber - contas a pagar
 ```
 
@@ -282,50 +284,62 @@ git status
 
 O arquivo `.env` e `data/bling_tokens.json` **não podem aparecer no commit**.
 
-## Escopo adicional para Caixas e Bancos
+## Escopos financeiros adicionais
 
-Para usar `/saldos` e a **Posição financeira**, o aplicativo cadastrado no Bling precisa ter o escopo de leitura **Caixas e Bancos**.
+Para usar `/saldos` e a **Posição financeira**, habilite no aplicativo do Bling:
+
+- **Caixas e Bancos** — leitura dos lançamentos e seus detalhes;
+- **Contas Contábeis** — usado para identificar o catálogo atual de contas financeiras, sem ressuscitar contas antigas apenas porque aparecem no histórico.
+
+Se `Contas Contábeis` não estiver autorizado, o bot possui um fallback conservador baseado nas contas movimentadas no mês atual, mas o recomendado é liberar os dois escopos.
 
 Se você já tinha autorizado o app antes de adicionar esse escopo:
 
 1. abra o cadastro do aplicativo no Bling;
-2. habilite **Caixas e Bancos** na Lista de escopos;
+2. habilite **Caixas e Bancos** e **Contas Contábeis** na Lista de escopos;
 3. salve o aplicativo;
 4. no Telegram, envie `/autorizar`;
 5. abra o novo link, autorize e cole a URL completa de retorno no bot.
 
 Apenas renovar o access token antigo não adiciona um novo escopo: é necessário reautorizar depois de alterar as permissões do app.
 
-### Como o saldo é calculado — importante
+### Como o saldo de Caixas e Bancos é calculado — importante
 
-Não use `GET /caixas` sem datas para calcular saldo. O período padrão desse endpoint pode representar somente a janela atual exibida pelo Bling. Somar apenas essa janela produz **movimento líquido do período**, e não necessariamente o saldo da conta.
+A versão anterior cometia dois erros conceituais: descobria bancos olhando todo o histórico e somava qualquer débito/crédito. Isso fazia contas antigas/inativadas reaparecerem e podia incluir registros que o próprio Bling marca como sem efeito no saldo.
 
-Nesta versão o bot sempre informa `dataInicial` e `dataFinal` e reconstrói o saldo desde `CASH_HISTORY_START` até a data atual. A API do Bling limita filtros de período a no máximo um ano, então o cliente quebra automaticamente o histórico em blocos seguros e pagina cada bloco de 100 em 100 registros.
+Nesta versão a regra é diferente:
 
-A fórmula passa a ser:
+1. `GET /contas-contabeis` define o catálogo **atual** de contas financeiras que podem aparecer no bot. Assim, uma conta antiga encontrada em 2022/2023 não volta ao menu apenas porque possui histórico.
+2. `GET /caixas` é usado para obter os lançamentos dessas contas.
+3. Quando necessário, o bot consulta `GET /caixas/{id}` para obter os indicadores financeiros do lançamento.
+4. Somente registros com `saldo=S` e situação regular (`situacao=R`) entram no cálculo. Registros `saldo=N` ou excluídos (`situacao=E`) são ignorados.
+5. O histórico é separado por **ID da conta financeira**, e não apenas pelo nome. Isso evita misturar uma conta atual com outra conta antiga que tenha recebido a mesma descrição.
 
-```text
-saldo atual reconstruído
-= créditos históricos que entraram no Caixa/Bancos
-- débitos históricos que saíram do Caixa/Bancos
-```
-
-O saldo inicial cadastrado na conta precisa estar dentro do histórico consultado. Por isso `CASH_HISTORY_START` deve ser uma data **anterior à criação da conta financeira mais antiga**. O padrão é `2000-01-01`, que normalmente dispensa configuração adicional.
-
-No detalhe de cada conta o bot também separa:
+A fórmula é:
 
 ```text
-saldo no início do mês
-+ entradas do mês
-- saídas do mês
-= saldo atual reconstruído
+saldo da conta atual
+= créditos válidos que afetam saldo
+- débitos válidos que afetam saldo
 ```
 
-Isso evita confundir, por exemplo, um movimento líquido mensal de R$ 293,14 com um saldo atual de R$ 377,14 quando já existia R$ 84,00 antes do mês.
+O campo `Saldo` do próprio Bling é relevante: registros marcados com `S` afetam o saldo do portador; registros marcados com `N` não. Por isso simplesmente somar o CSV/extrato visual não é suficiente em todos os casos.
 
-A consulta é mantida em cache em memória por 5 minutos para evitar reler todo o histórico a cada clique. O botão **Atualizar saldos** força uma nova leitura. A primeira consulta pode levar alguns segundos porque percorre o histórico completo.
+`CASH_HISTORY_START` continua sendo a data mínima a partir da qual o histórico será procurado. Use uma data anterior à criação das contas atuais. O cliente divide períodos longos automaticamente porque a API limita cada filtro de datas a no máximo um ano.
 
-Esse valor representa o saldo financeiro reconstruído a partir dos lançamentos **registrados no Bling**. Ele não consulta o internet banking em tempo real. Se houver movimentações no banco que ainda não estejam registradas/conciliadas no Bling, os valores podem divergir do aplicativo bancário.
+### Cache de detalhes de Caixas e Bancos
+
+Para conferir `saldo` e `situacao` sem repetir milhares de chamadas a cada clique, os detalhes antigos são persistidos em:
+
+```text
+/app/data/bling_cash_details.json
+```
+
+Esse arquivo fica no mesmo volume persistente de `/app/data` usado pelos tokens. Lançamentos do mês atual têm cache curto e podem ser atualizados pelo botão **Atualizar saldos**; detalhes históricos são reaproveitados por mais tempo.
+
+Na primeira sincronização precisa haver mais chamadas à API. As consultas seguintes ficam muito mais rápidas.
+
+O valor continua sendo o saldo financeiro **registrado no Bling**, não uma consulta ao internet banking.
 
 ## 8. Deploy no EasyPanel
 
@@ -368,7 +382,7 @@ Na seção **Storage** do App, crie um mount do tipo **Volume** e monte em:
 /app/data
 ```
 
-Esse volume é obrigatório porque o Bling entrega um novo `refresh_token` durante a renovação. O código substitui atomicamente `/app/data/bling_tokens.json` pelo token novo.
+Esse volume é obrigatório porque o Bling entrega um novo `refresh_token` durante a renovação. O código substitui atomicamente `/app/data/bling_tokens.json` pelo token novo. O mesmo volume também guarda `/app/data/bling_cash_details.json`, usado para acelerar a validação dos lançamentos de Caixas e Bancos.
 
 Sem volume persistente, um rebuild/redeploy pode apagar o arquivo e deixar o bot sem credencial válida.
 
@@ -491,7 +505,9 @@ GET  /Api/v3/contas/receber
 GET  /Api/v3/contas/receber/{id}
 GET  /Api/v3/contas/pagar
 GET  /Api/v3/contas/pagar/{id}
+GET  /Api/v3/contas-contabeis
 GET  /Api/v3/caixas
+GET  /Api/v3/caixas/{id}
 ```
 
 Base atual:
