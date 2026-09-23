@@ -1,571 +1,474 @@
-# Bot Financeiro Bling + Telegram
+# Bling Finance Bot v7 — Telegram + SQLite + Relatórios Gerenciais
 
-Bot assíncrono em Python para consultar a **API v3 do Bling** e entregar relatórios financeiros pelo Telegram usando botões inline e períodos livres.
+Bot financeiro em Python para Telegram integrado à API v3 do Bling. A versão v7 deixa de reconstruir anos de histórico a cada consulta: usa **SQLite persistente** em `/app/data/financeiro.db`, sincronização incremental e uma camada central de relatórios reutilizável.
 
-O projeto usa **long polling** do Telegram, portanto não precisa expor porta HTTP nem configurar domínio no EasyPanel.
+O bot usa **long polling**, portanto não precisa expor porta HTTP nem domínio no EasyPanel.
 
-## Funcionalidades
+## O que esta versão resolve
 
-- Contas a pagar por vencimento: Hoje, Esta Semana, Este Mês e Este Ano.
-- Contas a receber por vencimento: Hoje, Esta Semana, Este Mês e Este Ano.
-- Fluxo de caixa projetado: `A Receber - A Pagar`.
-- Período livre pelo comando:
+- Primeira carga automática: somente os últimos `CASH_BOOTSTRAP_DAYS` dias (padrão 90).
+- Uso normal: somente os últimos `CASH_SYNC_DAYS` dias (padrão 7) são relidos no Bling.
+- Histórico antigo fica salvo no SQLite e **não é reconsultado automaticamente**.
+- Se você alterar algo antigo no Bling, atualize só aquele intervalo com `/sincronizar INICIO FIM`.
+- Não existe mais varredura automática desde 2000 nem milhares de consultas individuais `/caixas/{id}`.
+- Categorias, fornecedor, CPF/CNPJ, histórico, conta financeira, débito/crédito e valor ficam persistidos no banco local quando a API os retorna.
+- Relatórios consultam o SQLite, não a API linha por linha.
+- Cálculos financeiros são feitos no backend Python/SQL; a camada de linguagem natural somente identifica intenção, período e filtros.
+
+## Banco local
+
+Arquivo persistente:
 
 ```text
-/fluxo YYYY-MM-DD YYYY-MM-DD
+/app/data/financeiro.db
 ```
 
-Exemplo:
+Principais tabelas:
 
 ```text
-/fluxo 2026-09-01 2026-09-30
+cash_accounts
+cash_movements
+categories
+category_classifications
+sync_state
+sync_periods
+app_settings
 ```
 
-- Paginação integral da API, com `limite=100` e avanço de `pagina` até o fim dos resultados.
-- Títulos parcialmente pagos/recebidos usam o campo `saldo` do detalhe da conta, em vez do valor original.
-- Intervalos maiores que o limite aceito pela API são divididos automaticamente em blocos menores.
-- OAuth 2.0 com autorização inicial/reautorização diretamente pelo Telegram, renovação automática de `access_token` e persistência do `refresh_token` rotativo.
-- Tokens gravados de forma atômica em `/app/data/bling_tokens.json`.
-- Lock assíncrono para impedir duas renovações simultâneas no mesmo processo.
-- Renovação preventiva 5 minutos antes do vencimento.
-- Retry automático após HTTP 401, 429 e erros 5xx transitórios.
-- Limitação interna de chamadas para permanecer abaixo do limite de 3 requisições/segundo do Bling.
-- Acesso ao bot restrito aos IDs configurados em `ALLOWED_USERS`.
-- Docker com usuário não-root.
+### Sincronização
 
-## Estrutura
+No uso diário:
+
+```text
+Telegram
+   ↓
+verifica janela recente
+   ↓
+GET /caixas (7 dias por padrão)
+   ↓
+substitui somente esse período no SQLite
+   ↓
+relatórios leem o SQLite
+```
+
+Se um lançamento dos últimos 7 dias foi editado ou excluído no Bling, a janela recente é substituída e o SQLite fica consistente.
+
+Para histórico antigo:
+
+```text
+/sincronizar 2025-01-01 2025-12-31
+```
+
+Esse período é buscado uma única vez e fica salvo. Se você nunca alterar 2025, não precisa consultar 2025 novamente.
+
+## Saldos de Caixas e Bancos
+
+A API usada neste projeto fornece os lançamentos de Caixas e Bancos, mas o saldo atual exibido no painel do Bling não é tratado como um campo confiável do catálogo de contas. Por isso a v7 usa **saldo-base calibrado uma única vez**.
+
+Fluxo recomendado:
+
+1. O bot sincroniza os últimos 90 dias.
+2. Use `/contas` e confirme quais contas devem ficar ativas.
+3. Use `/calibrar`.
+4. O bot pede os saldos atuais que aparecem no Bling, por exemplo:
+
+```text
+Bling Conta=1209,28; Caixa=734,88; Infinity Bank=377,14; Inter=0,74
+```
+
+5. O SQLite grava um saldo-base.
+6. Daí em diante:
+
+```text
+saldo atual = saldo-base + créditos posteriores - débitos posteriores
+```
+
+Assim não é necessário importar todos os lançamentos desde a criação da empresa apenas para manter o saldo atual.
+
+Se uma nova conta for criada, desativada ou houver mudança estrutural nas contas, use `/contas`, ajuste com `/ativar_conta` ou `/desativar_conta` e calibre novamente.
+
+## Relatórios gerenciais
+
+O comando `/relatorios` abre o menu com os 15 relatórios pedidos:
+
+1. Para onde vão cada R$ 100 gastos
+2. Ranking de categorias
+3. Ranking de fornecedores
+4. Histórico de fornecedor
+5. Despesas recorrentes / assinaturas
+6. Fixas x variáveis
+7. Evolução mensal
+8. Variação por categoria
+9. Pró-labore, retiradas e sócios
+10. Despesas administrativas
+11. Despesas operacionais
+12. DRE gerencial
+13. Custo por dia / hora (OPEX)
+14. Pequenas despesas acumuladas
+15. Gastos fora do padrão
+
+Também existe um **Resumo financeiro** quando a pergunta é ampla.
+
+### Linguagem natural
+
+O bot possui dois níveis de interpretação:
+
+1. **Parser local determinístico** — funciona sem serviço externo e cobre os períodos, filtros e relatórios documentados.
+2. **Interpretação por IA opcional** — se `OPENAI_API_KEY` estiver configurada, a pergunta é normalizada pela Responses API com saída estruturada antes de chegar ao parser local. A IA recebe somente a pergunta do usuário e a data atual; lançamentos, saldos e totais financeiros não são enviados. Toda soma, média, margem, ranking e comparação continua sendo calculada pelo backend SQLite. Se a IA estiver indisponível, o bot cai automaticamente para o parser local.
+
+Você pode simplesmente escrever no Telegram:
+
+```text
+Quanto gastei com software este ano?
+Me mostre as despesas por categoria de 2025.
+Quais foram meus maiores fornecedores este ano?
+Quanto gastei com OpenAI nos últimos 12 meses?
+Compare os gastos com combustível de 2025 e 2026.
+Qual foi meu custo operacional médio por mês em 2026?
+Quais despesas aumentaram muito este mês?
+Quanto estou gastando por dia para manter a empresa?
+Me mostre a DRE de janeiro até setembro de 2026.
+Quais pequenas despesas mais consumiram dinheiro este ano?
+Para onde foram cada R$ 100 que gastei este mês?
+O que mais aumentou de agosto para setembro?
+Faça um resumo financeiro de 2026.
+```
+
+Períodos reconhecidos:
+
+- hoje;
+- ontem;
+- esta semana;
+- semana passada;
+- este mês;
+- mês passado;
+- últimos 30 dias;
+- últimos 3, 6 ou 12 meses;
+- este ano;
+- ano passado;
+- ano específico;
+- mês específico;
+- intervalo de datas `DD/MM/AAAA` ou `AAAA-MM-DD`;
+- intervalos de meses, como janeiro até setembro de 2026;
+- comparações entre anos ou meses.
+
+Quando a pergunta pede comparação, o backend calcula período atual, período de referência, diferença em R$ e diferença percentual. A DRE comparativa mostra as principais linhas dos dois períodos.
+
+### Filtros
+
+A camada de relatórios suporta, conforme o tipo de relatório:
+
+- categoria;
+- categoria principal com inclusão automática das subcategorias;
+- fornecedor;
+- CPF/CNPJ;
+- conta financeira;
+- débito/crédito;
+- valor mínimo;
+- valor máximo;
+- período.
+
+## Categorias e classificação gerencial
+
+As categorias financeiras do Bling são sincronizadas para o SQLite. A primeira classificação é sugerida automaticamente apenas para tornar os relatórios úteis desde o início; o valor fica **persistido e editável**.
+
+Listar:
+
+```text
+/categorias
+```
+
+Editar:
+
+```text
+/classificar "Software" comportamento=fixed grupo=administrative dre=operating_expenses opex=sim
+```
+
+Valores aceitos:
+
+```text
+comportamento:
+fixed | variable | direct | administrative | other
+
+grupo:
+administrative | operational | commercial | marketing | financial | partners | taxes | revenue | other
+
+DRE:
+gross_revenue | deductions | direct_costs | operating_expenses |
+other_income | other_expenses | ignore | auto
+```
+
+Essa configuração é usada pelos relatórios de fixas/variáveis, administrativo, operacional, OPEX e DRE.
+
+## DRE gerencial
+
+A DRE é baseada nos lançamentos categorizados do SQLite e usa esta estrutura:
+
+```text
+Receita Bruta
+(-) Deduções / Impostos
+= Receita Líquida
+(-) Custos diretos
+= Lucro Bruto
+(-) Despesas Operacionais
+= Resultado Operacional
+(+) Outras receitas
+(-) Outras despesas
+= Resultado / Lucro Líquido
+```
+
+Mostra também margem bruta, operacional e líquida.
+
+Categorias ainda com `dre=auto` entram por uma regra conservadora e o relatório avisa que precisam ser revisadas. O mapeamento definitivo fica no banco e pode ser alterado por `/classificar`.
+
+## OPEX e custo por dia/hora
+
+Padrões iniciais:
+
+```text
+21 dias úteis/mês
+8 horas/dia
+```
+
+Consultar configurações:
+
+```text
+/configurar
+```
+
+Alterar:
+
+```text
+/configurar dias_uteis=21 horas_dia=8 anomalia_pct=30 anomalia_min=100 pequenas=100
+```
+
+## Comandos principais
+
+```text
+/start
+/menu
+
+/saldos
+/posicao
+/posicao 2026-09-22 2026-12-31
+
+/pagar
+/receber
+/fluxo
+/fluxo 2026-01-01 2026-12-31
+
+/relatorios
+/dre 2026
+/fornecedores 2026
+/recorrentes 2026
+/opex 2026
+/anomalias este mês
+
+/sincronizar
+/sincronizar 2025-01-01 2025-12-31
+/status_sync
+
+/contas
+/ativar_conta Infinity Bank
+/desativar_conta Pag Bank
+/calibrar
+
+/categorias
+/classificar "Software" comportamento=fixed grupo=administrative dre=operating_expenses opex=sim
+/configurar
+
+/autorizar
+/status_bling
+```
+
+## OAuth pelo Telegram
+
+O fluxo inicial pode ser feito sem terminal:
+
+1. envie `/autorizar`;
+2. toque em **Abrir autorização do Bling**;
+3. autorize o aplicativo;
+4. copie a URL completa que apareceu no navegador após o redirecionamento;
+5. cole essa URL no Telegram;
+6. o bot valida o `state`, extrai o `code`, troca por tokens e salva em `/app/data/bling_tokens.json`.
+
+O `refresh_token` é renovado automaticamente e gravado no volume persistente.
+
+`oauth_setup.py` continua existindo apenas como fallback administrativo.
+
+## Segurança
+
+- Somente IDs de `ALLOWED_USERS` acessam comandos e callbacks.
+- Tokens ficam fora do Git.
+- O token do Bling fica em `/app/data/bling_tokens.json`.
+- SQLite fica em `/app/data/financeiro.db`.
+- OAuth usa `state` por sessão.
+- Renovação de token usa lock assíncrono.
+- O container roda como usuário não-root.
+- Mantenha **1 réplica** do bot em polling. Duas réplicas com o mesmo token do Telegram geram `409 Conflict` em `getUpdates`.
+
+## Escopos necessários no Bling
+
+Habilite leitura para:
+
+- Contas a Receber;
+- Contas a Pagar;
+- Caixas e Bancos;
+- Contas Contábeis;
+- Categorias de Receitas e Despesas.
+
+Se adicionar um escopo depois de já ter autorizado o app, salve a alteração e execute `/autorizar` novamente.
+
+## Variáveis de ambiente
+
+```env
+TELEGRAM_BOT_TOKEN=TOKEN_REAL
+BLING_CLIENT_ID=CLIENT_ID_REAL
+BLING_CLIENT_SECRET=CLIENT_SECRET_REAL
+ALLOWED_USERS=123456789
+
+BLING_TOKEN_FILE=/app/data/bling_tokens.json
+CASH_DB_FILE=/app/data/financeiro.db
+
+CASH_BOOTSTRAP_DAYS=90
+CASH_SYNC_DAYS=7
+CASH_ACCOUNT_DISCOVERY_DAYS=90
+CASH_HISTORY_START=2000-01-01
+
+TZ=America/Sao_Paulo
+LOG_LEVEL=INFO
+
+# Opcional: melhora a interpretação de perguntas livres.
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.6-luna
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+`CASH_HISTORY_START` fica como limite administrativo para futuras operações de histórico, mas **não provoca varredura automática**.
+
+## EasyPanel
+
+Crie um **Aplicativo** usando o `Dockerfile` do projeto.
+
+### Volume obrigatório
+
+Monte um volume persistente em:
+
+```text
+/app/data
+```
+
+Ele guarda:
+
+```text
+/app/data/bling_tokens.json
+/app/data/financeiro.db
+/app/data/financeiro.db-wal
+/app/data/financeiro.db-shm
+```
+
+Sem esse volume, deploys podem apagar os tokens e o histórico local.
+
+### Réplicas
+
+Use:
+
+```text
+1 réplica
+```
+
+O Telegram long polling aceita somente uma instância consumindo `getUpdates` com o mesmo token.
+
+### Porta
+
+Nenhuma porta precisa ser publicada.
+
+## Primeira instalação recomendada
+
+1. Faça deploy.
+2. `/autorizar`.
+3. `/sincronizar` — primeira carga de 90 dias.
+4. `/contas` — confira quais contas ficaram ativas.
+5. Ajuste com `/ativar_conta` e `/desativar_conta` se necessário.
+6. `/calibrar` — informe os saldos atuais do painel do Bling uma única vez.
+7. Importe os anos que deseja analisar, uma vez por período, por exemplo:
+
+```text
+/sincronizar 2022-01-01 2022-12-31
+/sincronizar 2023-01-01 2023-12-31
+/sincronizar 2024-01-01 2024-12-31
+/sincronizar 2025-01-01 2025-12-31
+```
+
+8. `/categorias` e revise classificações gerenciais.
+9. Comece a perguntar em linguagem natural.
+
+Depois disso, o uso comum só atualiza a janela recente.
+
+## Estrutura do projeto
 
 ```text
 .
 ├── bot.py
 ├── bling.py
 ├── config.py
+├── finance_db.py
 ├── oauth_setup.py
+├── services/
+│   ├── __init__.py
+│   ├── ai_interpreter.py
+│   └── report_service.py
+├── reports/
+│   ├── base.py
+│   ├── common.py
+│   ├── formatting.py
+│   ├── category_report.py
+│   ├── supplier_report.py
+│   ├── recurring_report.py
+│   ├── fixed_variable_report.py
+│   ├── monthly_evolution.py
+│   ├── category_variation.py
+│   ├── partner_report.py
+│   ├── administrative_expenses.py
+│   ├── operational_expenses.py
+│   ├── dre_report.py
+│   ├── opex_report.py
+│   ├── small_expenses.py
+│   ├── anomaly_report.py
+│   ├── expense_search.py
+│   └── overview_report.py
+├── tests/
 ├── requirements.txt
 ├── Dockerfile
 ├── .env.example
-├── .gitignore
-├── .dockerignore
-├── data/
-│   └── .gitkeep
 └── README.md
 ```
 
-## Como o cálculo financeiro funciona
-
-O bot trata como pendentes as situações:
-
-- `1` — Em aberto
-- `3` — Parcial
-
-Para uma conta totalmente em aberto, o valor pendente é o `valor` do título. Para uma conta parcial, o bot consulta o endpoint individual da conta e usa `saldo`, evitando contabilizar como pendente uma parte que já foi paga/recebida.
-
-O filtro principal é a **data de vencimento**.
-
-Assim, para um período de 01/09 a 30/09:
+## Endpoints do Bling utilizados
 
 ```text
-A receber = saldo dos títulos a receber pendentes com vencimento no período
-A pagar   = saldo dos títulos a pagar pendentes com vencimento no período
-Fluxo     = A receber - A pagar
-```
-
-Isso representa um **fluxo projetado de obrigações e recebimentos pendentes**, e não o extrato de caixa já realizado.
-
-## 1. Criar o bot do Telegram
-
-1. Abra o Telegram e converse com `@BotFather`.
-2. Execute `/newbot`.
-3. Escolha nome e username.
-4. Copie o token fornecido.
-5. Descubra o seu ID numérico do Telegram.
-6. Coloque somente os IDs autorizados em `ALLOWED_USERS`.
-
-Exemplo:
-
-```env
-TELEGRAM_BOT_TOKEN=123456789:token_real_do_bot
-ALLOWED_USERS=123456789,987654321
-```
-
-Nunca envie o token do bot para o GitHub.
-
-## 2. Criar o aplicativo no Bling
-
-No painel/desenvolvedor do Bling, crie um aplicativo OAuth e habilite os escopos necessários para leitura de:
-
-- Contas a Receber
-- Contas a Pagar
-- Caixas e Bancos
-- Contas Contábeis
-
-No cadastro do aplicativo, configure também a URL de redirecionamento solicitada pelo Bling.
-
-Após salvar o aplicativo, copie:
-
-- `client_id`
-- `client_secret`
-
-Configure:
-
-```env
-BLING_CLIENT_ID=seu_client_id_real
-BLING_CLIENT_SECRET=seu_client_secret_real
-```
-
-A API usa OAuth 2.0 Authorization Code. O primeiro `authorization_code` é trocado por `access_token` e `refresh_token`. O projeto solicita tokens JWT com o header `enable-jwt: 1` e mantém esse header nas renovações e consultas seguintes.
-
-Documentação oficial:
-
-- https://developer.bling.com.br/aplicativos
-- https://developer.bling.com.br/migracao-jwt
-- https://developer.bling.com.br/limites
-
-## 3. Variáveis de ambiente
-
-Copie o modelo:
-
-```bash
-cp .env.example .env
-```
-
-Preencha o `.env`:
-
-```env
-TELEGRAM_BOT_TOKEN=TOKEN_REAL_DO_TELEGRAM
-BLING_CLIENT_ID=CLIENT_ID_REAL_DO_BLING
-BLING_CLIENT_SECRET=CLIENT_SECRET_REAL_DO_BLING
-ALLOWED_USERS=123456789
-BLING_TOKEN_FILE=/app/data/bling_tokens.json
-CASH_HISTORY_START=2000-01-01
-TZ=America/Sao_Paulo
-LOG_LEVEL=INFO
-```
-
-O `.env` está no `.gitignore` e **não deve ser commitado**.
-
-## 4. Autorizar o Bling pelo próprio Telegram
-
-A forma recomendada é fazer todo o bootstrap OAuth pelo bot, sem abrir o terminal do EasyPanel.
-
-Depois que o serviço estiver publicado e o volume `/app/data` estiver montado, envie no Telegram:
-
-```text
-/autorizar
-```
-
-O bot enviará um botão **Abrir autorização do Bling**. O fluxo é:
-
-1. Toque no botão.
-2. Entre no Bling e autorize o aplicativo.
-3. O Bling redirecionará para a URL cadastrada no aplicativo.
-4. Copie a **URL completa** da barra do navegador, incluindo `code=` e `state=`.
-5. Volte ao Telegram e cole essa URL como uma mensagem para o bot.
-6. O bot extrai o `code`, valida o `state`, troca o código por tokens e grava em `/app/data/bling_tokens.json`.
-
-Exemplo de URL de retorno:
-
-```text
-https://seu-callback.exemplo/?code=ABC123&state=XYZ456
-```
-
-O `authorization_code` expira rapidamente, portanto cole a URL no Telegram logo após o redirecionamento.
-
-Quando tudo der certo, o bot responderá:
-
-```text
-✅ Bling autenticado com sucesso.
-
-Os tokens foram salvos no volume persistente e a renovação automática está ativa.
-```
-
-Você também pode consultar a conexão com:
-
-```text
-/status_bling
-/saldos
-/posicao
-/posicao 2026-09-22 2026-12-31
-```
-
-ou pelo botão **Bling / Conexão** do menu.
-
-### Método de emergência pelo terminal
-
-O arquivo `oauth_setup.py` foi mantido como fallback administrativo. Se por algum motivo o fluxo pelo Telegram não puder ser usado, execute dentro do container:
-
-```bash
-python oauth_setup.py
-```
-
-O script gera o mesmo link OAuth e permite colar a URL de retorno no terminal. No uso normal, isso não é necessário.
-
-## 5. Rodar localmente sem Docker
-
-Requer Python 3.11+.
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-No Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-Se estiver rodando sem Docker, altere temporariamente no `.env`:
-
-```env
-BLING_TOKEN_FILE=./data/bling_tokens.json
-```
-
-Inicie o bot:
-
-```bash
-python bot.py
-```
-
-## 6. Testar o bot
-
-No Telegram:
-
-```text
-/start
-```
-
-ou:
-
-```text
-/menu
-```
-
-Comandos disponíveis:
-
-```text
-/start          abre o menu principal
-/menu           abre o menu principal
-/pagar          períodos de contas a pagar
-/receber        períodos de contas a receber
-/fluxo          períodos de fluxo por botões
-/fluxo 2026-01-01 2026-12-31
-/autorizar      gera o link OAuth do Bling no Telegram
-/status_bling   mostra o status da conexão
-/saldos         saldos das contas financeiras atuais do Bling
-/posicao        saldo atual + contas a receber - contas a pagar
-```
-
-Teste primeiro períodos curtos, por exemplo "Hoje". Depois teste mês e ano.
-
-## 7. Subir para o GitHub
-
-Dentro da pasta do projeto:
-
-```bash
-git init
-git add .
-git commit -m "feat: bot financeiro Bling Telegram"
-git branch -M main
-git remote add origin git@github.com:SEU_USUARIO/SEU_REPOSITORIO.git
-git push -u origin main
-```
-
-Antes do push confirme:
-
-```bash
-git status
-```
-
-O arquivo `.env` e `data/bling_tokens.json` **não podem aparecer no commit**.
-
-## Escopos financeiros adicionais
-
-Para usar `/saldos` e a **Posição financeira**, habilite no aplicativo do Bling:
-
-- **Caixas e Bancos** — leitura dos lançamentos e seus detalhes;
-- **Contas Contábeis** — usado para identificar o catálogo atual de contas financeiras, sem ressuscitar contas antigas apenas porque aparecem no histórico.
-
-Se `Contas Contábeis` não estiver autorizado, o bot possui um fallback conservador baseado nas contas movimentadas no mês atual, mas o recomendado é liberar os dois escopos.
-
-Se você já tinha autorizado o app antes de adicionar esse escopo:
-
-1. abra o cadastro do aplicativo no Bling;
-2. habilite **Caixas e Bancos** e **Contas Contábeis** na Lista de escopos;
-3. salve o aplicativo;
-4. no Telegram, envie `/autorizar`;
-5. abra o novo link, autorize e cole a URL completa de retorno no bot.
-
-Apenas renovar o access token antigo não adiciona um novo escopo: é necessário reautorizar depois de alterar as permissões do app.
-
-### Como o saldo de Caixas e Bancos é calculado — importante
-
-A versão anterior cometia dois erros conceituais: descobria bancos olhando todo o histórico e somava qualquer débito/crédito. Isso fazia contas antigas/inativadas reaparecerem e podia incluir registros que o próprio Bling marca como sem efeito no saldo.
-
-Nesta versão a regra é diferente:
-
-1. `GET /contas-contabeis` define o catálogo **atual** de contas financeiras que podem aparecer no bot. Assim, uma conta antiga encontrada em 2022/2023 não volta ao menu apenas porque possui histórico.
-2. `GET /caixas` é usado para obter os lançamentos dessas contas.
-3. Quando necessário, o bot consulta `GET /caixas/{id}` para obter os indicadores financeiros do lançamento.
-4. Somente registros com `saldo=S` e situação regular (`situacao=R`) entram no cálculo. Registros `saldo=N` ou excluídos (`situacao=E`) são ignorados.
-5. O histórico é separado por **ID da conta financeira**, e não apenas pelo nome. Isso evita misturar uma conta atual com outra conta antiga que tenha recebido a mesma descrição.
-
-A fórmula é:
-
-```text
-saldo da conta atual
-= créditos válidos que afetam saldo
-- débitos válidos que afetam saldo
-```
-
-O campo `Saldo` do próprio Bling é relevante: registros marcados com `S` afetam o saldo do portador; registros marcados com `N` não. Por isso simplesmente somar o CSV/extrato visual não é suficiente em todos os casos.
-
-`CASH_HISTORY_START` continua sendo a data mínima a partir da qual o histórico será procurado. Use uma data anterior à criação das contas atuais. O cliente divide períodos longos automaticamente porque a API limita cada filtro de datas a no máximo um ano.
-
-### Cache de detalhes de Caixas e Bancos
-
-Para conferir `saldo` e `situacao` sem repetir milhares de chamadas a cada clique, os detalhes antigos são persistidos em:
-
-```text
-/app/data/bling_cash_details.json
-```
-
-Esse arquivo fica no mesmo volume persistente de `/app/data` usado pelos tokens. Lançamentos do mês atual têm cache curto e podem ser atualizados pelo botão **Atualizar saldos**; detalhes históricos são reaproveitados por mais tempo.
-
-Na primeira sincronização precisa haver mais chamadas à API. As consultas seguintes ficam muito mais rápidas.
-
-O valor continua sendo o saldo financeiro **registrado no Bling**, não uma consulta ao internet banking.
-
-## 8. Deploy no EasyPanel
-
-Crie um **App Service**.
-
-### Source
-
-Escolha GitHub/Git e aponte para o repositório. Se o projeto estiver na raiz, use Build Path `/`.
-
-### Build
-
-Selecione `Dockerfile` e use:
-
-```text
-Dockerfile
-```
-
-O EasyPanel também detecta automaticamente um Dockerfile no Build Path em configurações compatíveis.
-
-### Environment
-
-Cadastre no painel, sem colocar secrets no Dockerfile:
-
-```env
-TELEGRAM_BOT_TOKEN=...
-BLING_CLIENT_ID=...
-BLING_CLIENT_SECRET=...
-ALLOWED_USERS=123456789
-BLING_TOKEN_FILE=/app/data/bling_tokens.json
-CASH_HISTORY_START=2000-01-01
-TZ=America/Sao_Paulo
-LOG_LEVEL=INFO
-```
-
-### Storage — etapa obrigatória
-
-Na seção **Storage** do App, crie um mount do tipo **Volume** e monte em:
-
-```text
-/app/data
-```
-
-Esse volume é obrigatório porque o Bling entrega um novo `refresh_token` durante a renovação. O código substitui atomicamente `/app/data/bling_tokens.json` pelo token novo. O mesmo volume também guarda `/app/data/bling_cash_details.json`, usado para acelerar a validação dos lançamentos de Caixas e Bancos.
-
-Sem volume persistente, um rebuild/redeploy pode apagar o arquivo e deixar o bot sem credencial válida.
-
-A documentação do EasyPanel alerta que alterações no filesystem do container podem ser perdidas quando o serviço é recriado; para dados persistentes deve ser usado um mount do tipo Volume.
-
-Referência:
-
-- https://easypanel.io/docs/services/app
-- https://easypanel.io/docs/builders
-
-### Porta e domínio
-
-Não são necessários para o bot, pois ele usa Telegram long polling.
-
-### Replicas
-
-Mantenha **1 réplica**.
-
-Este projeto usa um lock assíncrono em memória para proteger a renovação do token dentro de um único processo. Rodar várias réplicas compartilhando o mesmo refresh token pode criar corrida entre renovações e não é recomendado sem um lock distribuído.
-
-### Primeiro deploy
-
-1. Configure Environment.
-2. Configure o Volume em `/app/data`.
-3. Faça Deploy.
-4. Abra o Telegram e envie `/start`.
-5. Entre em **Bling / Conexão** ou envie `/autorizar`.
-6. Toque no link de autorização do Bling.
-7. Autorize, copie a URL completa do redirecionamento e cole no Telegram.
-8. O bot salvará `/app/data/bling_tokens.json` automaticamente.
-9. Teste um relatório pelo menu.
-
-Não é necessário expor porta HTTP nem criar domínio para o bot: o Telegram continua usando long polling e o retorno OAuth é colado manualmente no chat.
-
-## 9. Segurança
-
-### Telegram
-
-Todos os comandos e callbacks passam pela mesma checagem de `ALLOWED_USERS`.
-
-Tentativas não autorizadas recebem:
-
-```text
-⛔ Acesso negado.
-```
-
-O evento é registrado no log com o ID e username do Telegram, sem registrar credenciais do Bling.
-
-### Tokens
-
-- `client_secret`, `access_token` e `refresh_token` nunca devem ser commitados.
-- O arquivo de token é criado com permissão `0600` quando o filesystem suporta chmod.
-- A gravação usa arquivo temporário + `os.replace`, reduzindo risco de corrupção em reinício durante a escrita.
-- O novo refresh token é persistido antes de passar a ser usado em memória.
-
-### JWT do Bling
-
-O cliente envia:
-
-```text
-enable-jwt: 1
-```
-
-na obtenção, renovação e utilização dos tokens.
-
-## 10. Paginação e limites do Bling
-
-A documentação oficial do Bling informa:
-
-- até 100 registros por página por padrão;
-- parâmetro `pagina` para avançar;
-- parâmetro `limite` para controlar a página;
-- limite da conta de 3 requisições por segundo;
-- limite de 120.000 requisições por dia;
-- filtros por período acima de um ano retornam HTTP 400.
-
-O cliente deste projeto:
-
-1. solicita `limite=100`;
-2. continua incrementando `pagina` enquanto vierem 100 registros;
-3. faz uma requisição final para confirmar o término quando necessário;
-4. mantém espaçamento mínimo entre requests;
-5. trata 429 com backoff;
-6. divide intervalos longos em blocos de até 365 dias inclusivos.
-
-## 11. OAuth e renovação automática
-
-O Bling retorna `expires_in` junto do token. O projeto grava `expires_at` como timestamp absoluto.
-
-Antes de qualquer consulta:
-
-```text
-se agora + 5 minutos >= expires_at:
-    renovar token
-```
-
-Na renovação:
-
-1. adquire lock assíncrono;
-2. usa o `refresh_token` atual;
-3. recebe o novo `access_token` e o novo `refresh_token`;
-4. grava o novo par no volume;
-5. só então atualiza o estado em memória.
-
-Se uma chamada normal retornar HTTP 401, o cliente força uma renovação e repete a chamada uma vez.
-
-Se o refresh token deixar de ser válido ou for revogado, o bot exibirá a opção de autorização. Use:
-
-```text
-/autorizar
-```
-
-O `oauth_setup.py` permanece disponível apenas como fallback administrativo.
-
-## 12. Endpoints utilizados
-
-```text
-POST /Api/v3/oauth/token
+POST /oauth/token
 GET  /Api/v3/contas/receber
 GET  /Api/v3/contas/receber/{id}
 GET  /Api/v3/contas/pagar
 GET  /Api/v3/contas/pagar/{id}
 GET  /Api/v3/contas-contabeis
+GET  /Api/v3/categorias/receitas-despesas
 GET  /Api/v3/caixas
-GET  /Api/v3/caixas/{id}
 ```
 
-Base atual:
+Base:
 
 ```text
 https://api.bling.com.br/Api/v3
 ```
 
-O projeto não usa a URL antiga `https://bling.com.br/Api/v3`, cuja descontinuação foi anunciada pelo Bling.
+A API do Bling limita filtros de período a no máximo um ano e usa paginação. O cliente divide períodos longos em blocos compatíveis e usa `limite=100` por página. Isso ocorre apenas quando um período realmente precisa ser sincronizado.
 
-## 13. Troubleshooting
+## Testes
 
-### `Tokens do Bling ainda não foram configurados`
-
-No Telegram envie:
-
-```text
-/autorizar
+```bash
+PYTHONPATH=. python -m unittest discover -s tests -v
 ```
 
-Abra o link, autorize no Bling e cole a URL completa de retorno no chat. Confirme antes que `/app/data` está montado como volume persistente.
-
-### HTTP 403
-
-Normalmente indica que o usuário/app não concedeu o escopo necessário. Revise os escopos do aplicativo no Bling e refaça a autorização OAuth.
-
-### HTTP 401 recorrente
-
-O cliente tenta renovar automaticamente. Se a renovação falhar, use `/autorizar` no Telegram para reautorizar a conta.
-
-### HTTP 429
-
-O cliente já limita a frequência e possui backoff. Se o erro indicar limite diário, aguarde a renovação da franquia da API da conta.
-
-### Arquivo some depois do deploy
-
-O mount persistente do EasyPanel não está configurado corretamente. O caminho dentro do container deve ser exatamente:
-
-```text
-/app/data
-```
-
-### `Permission denied` em `/app/data`
-
-Confirme que o Volume está montado no caminho correto e que o usuário do container possui permissão de escrita no mount. O Dockerfile prepara `/app/data` para o usuário não-root `app`.
-
-## Dependências fixadas
-
-```text
-python-telegram-bot==22.8
-httpx==0.28.1
-python-dotenv==1.2.3
-```
-
-## Observação sobre o conceito de fluxo
-
-O relatório deste projeto responde à pergunta operacional:
-
-> Quanto tenho para receber menos quanto tenho para pagar, considerando os vencimentos pendentes dentro deste período?
-
-O relatório de títulos não substitui uma DRE. A versão atual também possui uma visão de **Caixas e Bancos** que reconstrói o saldo usando o histórico explícito de lançamentos e uma **Posição financeira** que combina esse saldo com o fluxo futuro de contas a receber e pagar.
+A versão entregue foi validada com `compileall`, 17 testes unitários e smoke tests cobrindo os 15 relatórios, SQLite, classificação, calibração de saldo, períodos em linguagem natural e comparações.

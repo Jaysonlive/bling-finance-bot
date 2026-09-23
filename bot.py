@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import calendar
 import logging
 import secrets
 import time
+import shlex
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +25,7 @@ from telegram.ext import (
 
 from bling import BlingAPIError, BlingAuthError, BlingClient
 from config import ConfigError, Settings
+from services import ReportService
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +46,25 @@ AUTH_STATE_KEY = "bling_oauth_state"
 AUTH_STARTED_KEY = "bling_oauth_started_at"
 AUTH_URL_KEY = "bling_oauth_url"
 AUTH_FLOW_TTL_SECONDS = 15 * 60
+CALIBRATION_PENDING_KEY = "cash_calibration_pending"
+
+REPORT_MENU = [
+    ("1️⃣ Para onde vão R$100", "catdist"),
+    ("2️⃣ Ranking categorias", "catrank"),
+    ("3️⃣ Ranking fornecedores", "suprank"),
+    ("4️⃣ Histórico fornecedor", "suphistory"),
+    ("5️⃣ Recorrentes", "recurring"),
+    ("6️⃣ Fixas x variáveis", "fixedvar"),
+    ("7️⃣ Evolução mensal", "evolution"),
+    ("8️⃣ Variação categorias", "variation"),
+    ("9️⃣ Pró-labore / sócios", "partners"),
+    ("🔟 Administrativas", "admin"),
+    ("1️⃣1️⃣ Operacionais", "operational"),
+    ("1️⃣2️⃣ DRE gerencial", "dre"),
+    ("1️⃣3️⃣ Custo dia/hora", "opex"),
+    ("1️⃣4️⃣ Pequenas despesas", "small"),
+    ("1️⃣5️⃣ Gastos fora do padrão", "anomaly"),
+]
 
 
 def format_brl(value: Decimal) -> str:
@@ -84,6 +107,8 @@ def menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("💸 Contas a pagar", callback_data="choose:pay")],
             [InlineKeyboardButton("💰 Contas a receber", callback_data="choose:recv")],
             [InlineKeyboardButton("📊 Fluxo líquido", callback_data="choose:flow")],
+            [InlineKeyboardButton("📚 Relatórios gerenciais", callback_data="reports:menu")],
+            [InlineKeyboardButton("🔄 Sincronização", callback_data="sync:menu")],
             [InlineKeyboardButton("🔗 Bling / Conexão", callback_data="bling:menu")],
         ]
     )
@@ -179,6 +204,43 @@ def auth_required_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+
+def reports_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label, callback_data=f"reports:{code}")] for label, code in REPORT_MENU]
+    rows.append([InlineKeyboardButton("⬅️ Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def sync_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Atualizar últimos dias", callback_data="sync:recent")],
+        [InlineKeyboardButton("💳 Calibrar saldos", callback_data="sync:calibrate")],
+        [InlineKeyboardButton("📋 Status do banco local", callback_data="sync:status")],
+        [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+    ])
+
+
+async def send_long_message(message, text: str, *, reply_markup=None) -> None:
+    chunks = []
+    remaining = text
+    while len(remaining) > 3900:
+        cut = remaining.rfind("\n", 0, 3900)
+        if cut < 1000:
+            cut = 3900
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    chunks.append(remaining)
+    for idx, chunk in enumerate(chunks):
+        await message.reply_text(chunk, reply_markup=reply_markup if idx == len(chunks)-1 else None)
+
+
+def _parse_decimal_br(value: str) -> Decimal:
+    raw = value.strip().replace("R$", "").replace(" ", "")
+    if "," in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    return Decimal(raw)
+
+
 def _clear_pending_oauth(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop(AUTH_STATE_KEY, None)
     context.user_data.pop(AUTH_STARTED_KEY, None)
@@ -250,6 +312,7 @@ async def ensure_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_allowed(update, context):
         return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
 
     await update.effective_message.reply_text(
         "Financeiro Bling\n\n"
@@ -362,6 +425,340 @@ async def fluxo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.effective_chat.send_action(ChatAction.TYPING)
     await _send_report(update, context, "flow", start, end, edit=False)
+
+
+async def relatorios_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    await update.effective_message.reply_text(
+        "📚 Relatórios gerenciais\n\nVocê pode tocar numa opção ou simplesmente escrever uma pergunta, por exemplo:\n"
+        "• Quanto gastei com alimentação este mês?\n"
+        "• Me mostre os 5 maiores fornecedores dos últimos 12 meses.\n"
+        "• Quanto custa um dia da empresa?\n"
+        "• Me mande a DRE de 2025.",
+        reply_markup=reports_keyboard(),
+    )
+
+
+async def sincronizar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    bling: BlingClient = context.application.bot_data["bling"]
+    tz: ZoneInfo = context.application.bot_data["timezone"]
+    today = datetime.now(tz).date()
+    try:
+        if not context.args:
+            start, end, count = await bling.sync_cash_recent(today, force=True)
+            await update.effective_message.reply_text(
+                f"✅ Sincronização incremental concluída.\n📅 {format_period(start,end)}\n"
+                f"Registros recebidos do Bling: {count}\n\n"
+                "O histórico antigo não foi reconsultado."
+            )
+            return
+        if len(context.args) != 2:
+            await update.effective_message.reply_text(
+                "Use /sincronizar para atualizar a janela recente ou:\n"
+                "/sincronizar YYYY-MM-DD YYYY-MM-DD"
+            )
+            return
+        start = date.fromisoformat(context.args[0])
+        end = date.fromisoformat(context.args[1])
+        if end < start:
+            raise ValueError("A data final não pode ser anterior à inicial.")
+        count = await bling.resync_cash_period(start, end)
+        await update.effective_message.reply_text(
+            f"✅ Período ressincronizado.\n📅 {format_period(start,end)}\n"
+            f"Registros gravados/atualizados: {count}\n\n"
+            "Somente esse intervalo foi buscado novamente no Bling."
+        )
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"⚠️ {exc}")
+    except (BlingAuthError, BlingAPIError) as exc:
+        await update.effective_message.reply_text(f"⚠️ Falha ao sincronizar: {str(exc)[:700]}")
+
+
+async def status_sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    bling: BlingClient = context.application.bot_data["bling"]
+    st = await bling.get_cash_sync_status()
+    last = st.last_sync_at.astimezone(context.application.bot_data["timezone"]).strftime("%d/%m/%Y %H:%M") if st.last_sync_at else "nunca"
+    text = (
+        "🗄 Banco financeiro local\n\n"
+        f"Lançamentos: {st.movements}\n"
+        f"Contas conhecidas: {st.accounts}\n"
+        f"Contas ativas: {st.enabled_accounts}\n"
+        f"Saldos calibrados: {st.calibrated_accounts}/{st.enabled_accounts}\n"
+        f"Categorias: {st.categories}\n"
+        f"Cobertura: {st.oldest_date or '—'} até {st.newest_date or '—'}\n"
+        f"Última sincronização: {last}\n"
+    )
+    await update.effective_message.reply_text(text, reply_markup=sync_keyboard())
+
+
+async def contas_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    bling: BlingClient = context.application.bot_data["bling"]
+    accounts = await bling.list_local_cash_accounts(enabled_only=False)
+    lines = ["🏦 Contas financeiras no banco local", ""]
+    for a in accounts:
+        mark = "✅" if a.enabled else "⏸"
+        base = f" | base {a.base_date:%d/%m/%Y}" if a.base_date else " | saldo não calibrado"
+        lines.append(f"{mark} {a.description} [{a.account_id}]{base}")
+    lines += ["", "Para corrigir detecção automática:", "/ativar_conta NOME", "/desativar_conta NOME"]
+    await send_long_message(update.effective_message, "\n".join(lines))
+
+
+async def ativar_conta_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Uso: /ativar_conta nome da conta")
+        return
+    bling: BlingClient = context.application.bot_data["bling"]
+    try:
+        a = await bling.set_cash_account_enabled(" ".join(context.args), True)
+        await update.effective_message.reply_text(f"✅ Conta ativada: {a.description}")
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"⚠️ {exc}")
+
+
+async def desativar_conta_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Uso: /desativar_conta nome da conta")
+        return
+    bling: BlingClient = context.application.bot_data["bling"]
+    try:
+        a = await bling.set_cash_account_enabled(" ".join(context.args), False)
+        await update.effective_message.reply_text(f"⏸ Conta desativada: {a.description}")
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"⚠️ {exc}")
+
+
+async def calibrar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    bling: BlingClient = context.application.bot_data["bling"]
+    tz: ZoneInfo = context.application.bot_data["timezone"]
+    today = datetime.now(tz).date()
+    await bling.sync_cash_recent(today, force=True)
+    accounts = await bling.list_local_cash_accounts(enabled_only=True)
+    if not accounts:
+        await update.effective_message.reply_text("⚠️ Nenhuma conta ativa detectada. Use /contas e ative as contas corretas.")
+        return
+    context.user_data[CALIBRATION_PENDING_KEY] = True
+    names = "; ".join(f"{a.description}=0,00" for a in accounts)
+    await update.effective_message.reply_text(
+        "💳 Calibração de saldo\n\n"
+        "A API pública do Bling não expõe o saldo inicial/atual das contas no catálogo. "
+        "Por isso, informe uma única vez os saldos que aparecem hoje no painel do Bling. "
+        "Depois o SQLite mantém o saldo por sincronização incremental.\n\n"
+        "Responda nesta conversa no formato:\n" + names + "\n\n"
+        "Exemplo: Bling Conta=1209,28; Caixa=734,88; Infinity Bank=377,14; Inter=0,74"
+    )
+
+
+async def categorias_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    bling: BlingClient = context.application.bot_data["bling"]
+    db = bling.cash_db
+    try:
+        await bling.sync_categories(force=False)
+    except (BlingAuthError, BlingAPIError) as exc:
+        logger.warning("Categorias usando cache local: %s", exc)
+    rows = await asyncio.to_thread(db.classification_rows)
+    lines = ["🏷 Categorias e classificação gerencial", ""]
+    for r in rows[:80]:
+        lines.append(
+            f"• {r['description']} | {r['cost_behavior']} | {r['managerial_group']} | "
+            f"DRE={r['dre_line']} | OPEX={'sim' if r['is_opex'] else 'não'}"
+        )
+    lines += ["", "Editar:", '/classificar "Software" comportamento=fixed grupo=administrative dre=operating_expenses opex=sim']
+    await send_long_message(update.effective_message, "\n".join(lines))
+
+
+async def classificar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.effective_message.reply_text(
+            'Uso: /classificar "Categoria" comportamento=fixed grupo=administrative dre=operating_expenses opex=sim\n\n'
+            "Comportamento: fixed, variable, direct, administrative, other\n"
+            "Grupo: administrative, operational, commercial, marketing, financial, partners, taxes, revenue, other\n"
+            "DRE: gross_revenue, deductions, direct_costs, operating_expenses, other_income, other_expenses, ignore, auto"
+        )
+        return
+    try:
+        parts = shlex.split(raw)
+        category = parts[0]
+        opts: dict[str, str] = {}
+        for token in parts[1:]:
+            if "=" in token:
+                k, v = token.split("=", 1)
+                opts[k.casefold()] = v.strip()
+        allowed_behavior = {"fixed", "variable", "direct", "administrative", "other"}
+        allowed_group = {"administrative", "operational", "commercial", "marketing", "financial", "partners", "taxes", "revenue", "other"}
+        allowed_dre = {"gross_revenue", "deductions", "direct_costs", "operating_expenses", "other_income", "other_expenses", "ignore", "auto"}
+        if "comportamento" in opts and opts["comportamento"] not in allowed_behavior:
+            raise ValueError("comportamento inválido")
+        if "grupo" in opts and opts["grupo"] not in allowed_group:
+            raise ValueError("grupo inválido")
+        if "dre" in opts and opts["dre"] not in allowed_dre:
+            raise ValueError("linha DRE inválida")
+        kwargs = {}
+        if "comportamento" in opts:
+            kwargs["cost_behavior"] = opts["comportamento"]
+        if "grupo" in opts:
+            kwargs["managerial_group"] = opts["grupo"]
+        if "dre" in opts:
+            kwargs["dre_line"] = opts["dre"]
+        if "notas" in opts:
+            kwargs["notes"] = opts["notas"]
+        if "opex" in opts:
+            kwargs["is_opex"] = opts["opex"].casefold() in {"1", "sim", "s", "true", "yes"}
+        db = context.application.bot_data["bling"].cash_db
+        updated = await asyncio.to_thread(db.set_category_classification, category, **kwargs)
+        rows = await asyncio.to_thread(db.classification_rows)
+        cls = next((r for r in rows if str(r["category_id"]) == str(updated["category_id"])), None) or {}
+        await update.effective_message.reply_text(
+            f"✅ Categoria atualizada: {updated['description']}\n"
+            f"Comportamento: {cls.get('cost_behavior', 'other')}\n"
+            f"Grupo: {cls.get('managerial_group', 'other')}\n"
+            f"DRE: {cls.get('dre_line', 'auto')}\n"
+            f"OPEX: {'sim' if cls.get('is_opex') else 'não'}"
+        )
+    except (ValueError, IndexError) as exc:
+        await update.effective_message.reply_text(f"⚠️ {exc}")
+
+
+async def configurar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    db = context.application.bot_data["bling"].cash_db
+    raw = " ".join(context.args).strip()
+    if not raw:
+        settings = await asyncio.to_thread(db.all_settings)
+        await update.effective_message.reply_text(
+            "⚙️ Configurações gerenciais\n\n"
+            f"Dias úteis/mês: {settings.get('workdays_per_month', '21')}\n"
+            f"Horas/dia: {settings.get('workhours_per_day', '8')}\n"
+            f"Anomalia: +{settings.get('anomaly_percent_threshold', '30')}%\n"
+            f"Valor mínimo anomalia: R$ {settings.get('anomaly_min_amount', '100')}\n"
+            f"Pequena despesa padrão: R$ {settings.get('small_expense_threshold', '100')}\n\n"
+            "Alterar, por exemplo:\n"
+            "/configurar dias_uteis=21 horas_dia=8 anomalia_pct=30 anomalia_min=100 pequenas=100"
+        )
+        return
+    mapping = {
+        "dias_uteis": "workdays_per_month",
+        "horas_dia": "workhours_per_day",
+        "anomalia_pct": "anomaly_percent_threshold",
+        "anomalia_min": "anomaly_min_amount",
+        "pequenas": "small_expense_threshold",
+    }
+    changed = []
+    try:
+        for token in shlex.split(raw):
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            if key not in mapping:
+                raise ValueError(f"Configuração desconhecida: {key}")
+            Decimal(value.replace(",", "."))
+            await asyncio.to_thread(db.set_setting, mapping[key], value.replace(",", "."))
+            changed.append(key)
+        if not changed:
+            raise ValueError("Nenhuma configuração reconhecida.")
+        await update.effective_message.reply_text("✅ Configurações atualizadas: " + ", ".join(changed))
+    except (ValueError, ArithmeticError) as exc:
+        await update.effective_message.reply_text(f"⚠️ {exc}")
+
+
+async def _run_management_report(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    tz: ZoneInfo = context.application.bot_data["timezone"]
+    service: ReportService = context.application.bot_data["reports"]
+    bling: BlingClient = context.application.bot_data["bling"]
+    today = datetime.now(tz).date()
+    # Keep the recent window fresh before querying SQLite. Historical periods are
+    # never rescanned here; missing coverage is reported with /sincronizar guidance.
+    try:
+        await bling.sync_cash_recent(today, force=False)
+    except (BlingAuthError, BlingAPIError) as exc:
+        logger.warning("Relatório usando cache local porque a sincronização recente falhou: %s", exc)
+    try:
+        output = await asyncio.to_thread(service.answer, text, today)
+        target = update.effective_message
+        if target:
+            await send_long_message(target, output, reply_markup=reports_keyboard())
+        elif update.callback_query:
+            await update.callback_query.edit_message_text("✅ Relatório gerado abaixo.")
+            await send_long_message(update.callback_query.message, output, reply_markup=reports_keyboard())
+    except Exception as exc:
+        logger.exception("Erro ao gerar relatório gerencial")
+        msg = update.effective_message or (update.callback_query.message if update.callback_query else None)
+        if msg:
+            await msg.reply_text(f"⚠️ Não foi possível gerar o relatório: {str(exc)[:700]}")
+
+
+async def dre_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context): return
+    await _run_management_report(update, context, "DRE " + " ".join(context.args))
+
+
+async def fornecedores_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context): return
+    await _run_management_report(update, context, "maiores fornecedores " + " ".join(context.args))
+
+
+async def recorrentes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context): return
+    await _run_management_report(update, context, "despesas recorrentes " + " ".join(context.args))
+
+
+async def opex_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context): return
+    await _run_management_report(update, context, "OPEX custo por dia e hora " + " ".join(context.args))
+
+
+async def anomalias_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context): return
+    await _run_management_report(update, context, "gastos fora do padrão " + " ".join(context.args))
+
+
+async def natural_language_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    # OAuth has priority.
+    if _pending_oauth_is_valid(context):
+        await oauth_callback_message(update, context)
+        return
+    if context.user_data.get(CALIBRATION_PENDING_KEY):
+        bling: BlingClient = context.application.bot_data["bling"]
+        tz: ZoneInfo = context.application.bot_data["timezone"]
+        try:
+            balances = {}
+            for piece in message.text.split(";"):
+                if "=" not in piece:
+                    continue
+                name, value = piece.split("=",1)
+                balances[name.strip()] = _parse_decimal_br(value)
+            if not balances:
+                raise ValueError("Nenhum saldo reconhecido. Separe as contas por ponto e vírgula.")
+            accounts = await bling.calibrate_cash_balances(balances, datetime.now(tz).date())
+            context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+            await message.reply_text("✅ Saldos calibrados. A partir de agora o banco local atualiza os saldos com os novos lançamentos do Bling.\n\n" + "\n".join(f"• {a.description}" for a in accounts))
+        except Exception as exc:
+            await message.reply_text(f"⚠️ Não consegui calibrar: {exc}\nTente novamente ou envie /menu para cancelar.")
+        return
+    await _run_management_report(update, context, message.text)
 
 
 async def _bling_status(context: ContextTypes.DEFAULT_TYPE) -> tuple[bool, str]:
@@ -547,16 +944,17 @@ def _cash_summary_text(summary) -> str:
         lines.append("Nenhum lançamento financeiro foi retornado pelo Bling.")
     else:
         for account in summary.accounts:
-            lines.append(f"🏦 {account.description}: {format_brl(account.balance)}")
-        lines.extend(
-            [
-                "",
-                f"💵 Saldo total no Bling: {format_brl(summary.total_balance)}",
-                "",
-                "ℹ️ São consideradas somente as contas financeiras atuais do Bling e "
-                "lançamentos válidos que afetam saldo. Não é consulta em tempo real ao internet banking.",
-            ]
-        )
+            value = format_brl(account.balance) if account.balance is not None else "⚠️ calibrar"
+            lines.append(f"🏦 {account.description}: {value}")
+        lines.append("")
+        if summary.fully_calibrated:
+            lines.append(f"💵 Saldo total calculado: {format_brl(summary.total_balance)}")
+        else:
+            lines.append("⚠️ Há contas sem saldo-base calibrado. Use /calibrar uma vez para ancorar o saldo atual do Bling.")
+        lines.extend([
+            "",
+            "ℹ️ Depois da calibração, o SQLite mantém o saldo com sincronização incremental dos lançamentos do Bling.",
+        ])
     return "\n".join(lines)
 
 
@@ -626,13 +1024,13 @@ async def _send_cash_account(
             (m.amount for m in month_movements if m.direction == "D"), Decimal("0")
         )
         month_net = month_credits - month_debits
-        opening_month_balance = account.balance - month_net
+        opening_month_balance = (account.balance - month_net) if account.balance is not None else None
         lines = [
             f"🏦 {account.description}",
             "",
-            f"💳 Saldo atual no Bling: {format_brl(account.balance)}",
+            f"💳 Saldo calculado: {format_brl(account.balance) if account.balance is not None else '⚠️ não calibrado'}",
             "",
-            f"Saldo no início do mês: {format_brl(opening_month_balance)}",
+            f"Saldo no início do mês: {format_brl(opening_month_balance) if opening_month_balance is not None else '—'}",
             f"Entradas no mês: {format_brl(month_credits)}",
             f"Saídas no mês: {format_brl(month_debits)}",
             f"Movimento líquido no mês: {format_brl(month_net)}",
@@ -682,6 +1080,17 @@ async def _send_financial_position(
     try:
         cash = await bling.get_cash_summary(today)
         flow = await bling.get_financial_summary(start, end)
+        if not cash.fully_calibrated:
+            text = (
+                "⚠️ Para calcular a posição financeira com saldo atual, primeiro calibre as contas com /calibrar.\n\n"
+                "A API pública do Bling fornece os lançamentos, mas não o saldo inicial/atual das contas no catálogo."
+            )
+            keyboard = sync_keyboard()
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+            elif update.effective_message:
+                await update.effective_message.reply_text(text, reply_markup=keyboard)
+            return
         projected = cash.total_balance + flow.net
         signal = "🟢" if projected >= 0 else "🔴"
         text = (
@@ -781,6 +1190,93 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             end = date(today.year, 12, 31)
         await query.edit_message_text("⏳ Calculando posição financeira...")
         await _send_financial_position(update, context, today, end, edit=True)
+        return
+
+    if data == "reports:menu":
+        await query.edit_message_text(
+            "📚 Relatórios gerenciais\n\nToque numa opção ou escreva sua pergunta em linguagem natural.",
+            reply_markup=reports_keyboard(),
+        )
+        return
+
+    if data.startswith("reports:"):
+        code = data.split(":", 1)[1]
+        prompts = {
+            "catdist": "Para onde foram cada R$ 100 que gastei este mês?",
+            "catrank": "Quais as 10 categorias que mais consumiram dinheiro este mês?",
+            "suprank": "Quais foram meus 10 maiores fornecedores este mês?",
+            "suphistory": "Quais foram meus maiores fornecedores este mês?",
+            "recurring": "Quais são minhas despesas recorrentes nos últimos 12 meses?",
+            "fixedvar": "Quanto tenho de despesas fixas x variáveis este mês?",
+            "evolution": "Mostre a evolução das despesas nos últimos 12 meses",
+            "variation": "O que mais aumentou este mês em relação ao mês passado?",
+            "partners": "Quanto foi pago de pró-labore e retiradas este ano?",
+            "admin": "Qual meu custo administrativo este ano?",
+            "operational": "Quanto gastei com operação este ano?",
+            "dre": "Me mostre a DRE deste mês",
+            "opex": "Quanto custa um dia e uma hora da empresa este mês?",
+            "small": "Quanto gastei em despesas abaixo de R$ 100 este ano?",
+            "anomaly": "Tem algum gasto fora do padrão este mês?",
+        }
+        if code == "suphistory":
+            await query.edit_message_text(
+                "👤 Histórico de fornecedor\n\n"
+                "Escreva o nome, CPF/CNPJ e o período. Exemplos:\n"
+                "• Quanto já paguei para Google em 2026?\n"
+                "• Mostre o histórico do fornecedor OpenAI desde 2024.\n"
+                "• Quanto paguei para 00.000.000/0001-00 este ano?",
+                reply_markup=reports_keyboard(),
+            )
+            return
+        prompt = prompts.get(code)
+        if not prompt:
+            await query.edit_message_text("Opção inválida.", reply_markup=reports_keyboard())
+            return
+        await _run_management_report(update, context, prompt)
+        return
+
+    if data == "sync:menu":
+        await query.edit_message_text(
+            "🔄 Sincronização do banco local\n\nNo uso normal só a janela recente é consultada. Histórico antigo só é reconsultado com /sincronizar INICIO FIM.",
+            reply_markup=sync_keyboard(),
+        )
+        return
+
+    if data == "sync:recent":
+        bling: BlingClient = context.application.bot_data["bling"]
+        tz: ZoneInfo = context.application.bot_data["timezone"]
+        today = datetime.now(tz).date()
+        await query.edit_message_text("⏳ Atualizando a janela recente no SQLite...")
+        try:
+            start, end, count = await bling.sync_cash_recent(today, force=True)
+            await query.edit_message_text(
+                f"✅ Atualizado: {format_period(start,end)}\nRegistros recebidos: {count}",
+                reply_markup=sync_keyboard(),
+            )
+        except Exception as exc:
+            await query.edit_message_text(f"⚠️ Falha: {str(exc)[:600]}", reply_markup=sync_keyboard())
+        return
+
+    if data == "sync:status":
+        bling: BlingClient = context.application.bot_data["bling"]
+        st = await bling.get_cash_sync_status()
+        await query.edit_message_text(
+            "🗄 Banco financeiro local\n\n"
+            f"Lançamentos: {st.movements}\nContas ativas: {st.enabled_accounts}\n"
+            f"Saldos calibrados: {st.calibrated_accounts}/{st.enabled_accounts}\nCategorias: {st.categories}\n"
+            f"Cobertura: {st.oldest_date or '—'} até {st.newest_date or '—'}",
+            reply_markup=sync_keyboard(),
+        )
+        return
+
+    if data == "sync:calibrate":
+        context.user_data[CALIBRATION_PENDING_KEY] = True
+        bling: BlingClient = context.application.bot_data["bling"]
+        accounts = await bling.list_local_cash_accounts(enabled_only=True)
+        sample = "; ".join(f"{a.description}=0,00" for a in accounts) if accounts else "Conta=0,00"
+        await query.edit_message_text(
+            "💳 Calibração\n\nEnvie agora uma mensagem com os saldos atuais exibidos no Bling, por exemplo:\n" + sample
+        )
         return
 
     if data == "bling:menu":
@@ -932,6 +1428,18 @@ async def post_init(application: Application) -> None:
             BotCommand("receber", "Contas a receber"),
             BotCommand("autorizar", "Autorizar ou reautorizar o Bling"),
             BotCommand("status_bling", "Ver status da conexão com o Bling"),
+            BotCommand("relatorios", "Abrir relatórios gerenciais"),
+            BotCommand("sincronizar", "Atualizar banco local ou um período"),
+            BotCommand("status_sync", "Status da sincronização SQLite"),
+            BotCommand("calibrar", "Calibrar saldos atuais uma vez"),
+            BotCommand("contas", "Ver/gerenciar contas financeiras"),
+            BotCommand("categorias", "Ver classificações gerenciais"),
+            BotCommand("dre", "DRE gerencial"),
+            BotCommand("fornecedores", "Ranking de fornecedores"),
+            BotCommand("recorrentes", "Despesas recorrentes"),
+            BotCommand("opex", "Custo por dia e hora"),
+            BotCommand("anomalias", "Gastos fora do padrão"),
+            BotCommand("configurar", "Configurações gerenciais"),
             BotCommand("menu", "Abrir menu"),
         ]
     )
@@ -959,6 +1467,10 @@ def main() -> None:
         client_secret=settings.bling_client_secret,
         token_file=settings.bling_token_file,
         cash_history_start=settings.cash_history_start,
+        cash_db_file=settings.cash_db_file,
+        cash_bootstrap_days=settings.cash_bootstrap_days,
+        cash_sync_days=settings.cash_sync_days,
+        cash_account_discovery_days=settings.cash_account_discovery_days,
     )
 
     application = (
@@ -971,6 +1483,12 @@ def main() -> None:
     application.bot_data["settings"] = settings
     application.bot_data["timezone"] = timezone
     application.bot_data["bling"] = bling
+    application.bot_data["reports"] = ReportService(
+        bling.cash_db,
+        ai_api_key=settings.openai_api_key,
+        ai_model=settings.openai_model,
+        ai_base_url=settings.openai_base_url,
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
@@ -981,9 +1499,24 @@ def main() -> None:
     application.add_handler(CommandHandler("fluxo", fluxo_command))
     application.add_handler(CommandHandler("autorizar", authorize_command))
     application.add_handler(CommandHandler("status_bling", bling_status_command))
+    application.add_handler(CommandHandler("relatorios", relatorios_command))
+    application.add_handler(CommandHandler("sincronizar", sincronizar_command))
+    application.add_handler(CommandHandler("status_sync", status_sync_command))
+    application.add_handler(CommandHandler("contas", contas_command))
+    application.add_handler(CommandHandler("ativar_conta", ativar_conta_command))
+    application.add_handler(CommandHandler("desativar_conta", desativar_conta_command))
+    application.add_handler(CommandHandler("calibrar", calibrar_command))
+    application.add_handler(CommandHandler("categorias", categorias_command))
+    application.add_handler(CommandHandler("classificar", classificar_command))
+    application.add_handler(CommandHandler("dre", dre_command))
+    application.add_handler(CommandHandler("fornecedores", fornecedores_command))
+    application.add_handler(CommandHandler("recorrentes", recorrentes_command))
+    application.add_handler(CommandHandler("opex", opex_command))
+    application.add_handler(CommandHandler("anomalias", anomalias_command))
+    application.add_handler(CommandHandler("configurar", configurar_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, oauth_callback_message)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, natural_language_message)
     )
     application.add_error_handler(error_handler)
 
