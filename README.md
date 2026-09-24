@@ -1,6 +1,6 @@
-# Bling Finance Bot v7 — Telegram + SQLite + Relatórios Gerenciais
+# Bling Finance Bot v8 — Telegram + SQLite + Relatórios + Lançamentos
 
-Bot financeiro em Python para Telegram integrado à API v3 do Bling. A versão v7 deixa de reconstruir anos de histórico a cada consulta: usa **SQLite persistente** em `/app/data/financeiro.db`, sincronização incremental e uma camada central de relatórios reutilizável.
+Bot financeiro em Python para Telegram integrado à API v3 do Bling. A versão v8 mantém a arquitetura que deixa de reconstruir anos de histórico a cada consulta e acrescenta criação segura de contas e lançamentos pelo Telegram: usa **SQLite persistente** em `/app/data/financeiro.db`, sincronização incremental e uma camada central de relatórios reutilizável.
 
 O bot usa **long polling**, portanto não precisa expor porta HTTP nem domínio no EasyPanel.
 
@@ -14,6 +14,46 @@ O bot usa **long polling**, portanto não precisa expor porta HTTP nem domínio 
 - Categorias, fornecedor, CPF/CNPJ, histórico, conta financeira, débito/crédito e valor ficam persistidos no banco local quando a API os retorna.
 - Relatórios consultam o SQLite, não a API linha por linha.
 - Cálculos financeiros são feitos no backend Python/SQL; a camada de linguagem natural somente identifica intenção, período e filtros.
+
+## Lançamentos pelo Telegram
+
+A v8 permite **gravar no Bling**, com confirmação antes do envio:
+
+- conta a pagar;
+- conta a receber;
+- saída à vista em Caixas e Bancos;
+- entrada à vista em Caixas e Bancos.
+
+Abra pelo botão **➕ Novo lançamento** ou use:
+
+```text
+/lancar
+/nova_pagar
+/nova_receber
+/caixa_saida
+/caixa_entrada
+```
+
+O assistente solicita os dados em etapas. Os campos essenciais ficam obrigatórios no fluxo:
+
+```text
+Conta a pagar
+Fornecedor → valor → competência → vencimento → categoria → conta financeira opcional → histórico → confirmação
+
+Conta a receber
+Cliente → valor → competência → vencimento → categoria → conta financeira opcional → histórico → confirmação
+
+Pagamento à vista / recebimento à vista
+Fornecedor ou cliente → valor → competência → data do caixa → categoria → conta financeira obrigatória → histórico → confirmação
+```
+
+O contato é pesquisado diretamente no cadastro de **Contatos do Bling** por nome, CPF/CNPJ ou código. A categoria é pesquisada no catálogo sincronizado do Bling e o seletor respeita o tipo: **despesa** para contas/saídas e **receita** para contas/entradas; categorias configuradas como receita e despesa também podem aparecer.
+
+Nenhum lançamento é enviado enquanto o usuário não tocar em **✅ Confirmar e lançar no Bling**. Se o OAuth tiver expirado ou a API rejeitar os dados, o bot informa que o lançamento não foi confirmado e mantém a opção de tentar novamente.
+
+Para lançamentos à vista, depois da criação o bot ressincroniza **somente o dia do lançamento** no SQLite. Isso mantém o banco local atualizado sem reconstruir anos de histórico.
+
+> Nesta versão o fornecedor/cliente e a categoria precisam já existir no Bling. O bot pesquisa e seleciona os cadastros existentes; ele não cria um novo contato ou uma nova categoria automaticamente.
 
 ## Banco local
 
@@ -63,7 +103,7 @@ Esse período é buscado uma única vez e fica salvo. Se você nunca alterar 202
 
 ## Saldos de Caixas e Bancos
 
-A API usada neste projeto fornece os lançamentos de Caixas e Bancos, mas o saldo atual exibido no painel do Bling não é tratado como um campo confiável do catálogo de contas. Por isso a v7 usa **saldo-base calibrado uma única vez**.
+A API usada neste projeto fornece os lançamentos de Caixas e Bancos, mas o saldo atual exibido no painel do Bling não é tratado como um campo confiável do catálogo de contas. Por isso a v8 usa **saldo-base calibrado uma única vez**.
 
 Fluxo recomendado:
 
@@ -248,6 +288,12 @@ Alterar:
 /start
 /menu
 
+/lancar
+/nova_pagar
+/nova_receber
+/caixa_saida
+/caixa_entrada
+
 /saldos
 /posicao
 /posicao 2026-09-22 2026-12-31
@@ -309,15 +355,16 @@ O `refresh_token` é renovado automaticamente e gravado no volume persistente.
 
 ## Escopos necessários no Bling
 
-Habilite leitura para:
+O aplicativo precisa ter acesso aos módulos usados pelo bot:
 
-- Contas a Receber;
-- Contas a Pagar;
-- Caixas e Bancos;
-- Contas Contábeis;
-- Categorias de Receitas e Despesas.
+- Contas a Receber — consulta e criação;
+- Contas a Pagar — consulta e criação;
+- Caixas e Bancos — consulta e criação de entradas/saídas à vista;
+- Contas Financeiras / Contas Contábeis — leitura;
+- Categorias de Receitas e Despesas — leitura;
+- Contatos — leitura para localizar cliente/fornecedor.
 
-Se adicionar um escopo depois de já ter autorizado o app, salve a alteração e execute `/autorizar` novamente.
+Se você ampliar as permissões do aplicativo depois de já ter autorizado o bot, salve a alteração no Bling e execute `/autorizar` novamente para emitir tokens com o acesso atualizado.
 
 ## Variáveis de ambiente
 
@@ -413,6 +460,7 @@ Depois disso, o uso comum só atualiza a janela recente.
 ├── bling.py
 ├── config.py
 ├── finance_db.py
+├── entry_flow.py
 ├── oauth_setup.py
 ├── services/
 │   ├── __init__.py
@@ -448,13 +496,17 @@ Depois disso, o uso comum só atualiza a janela recente.
 
 ```text
 POST /oauth/token
+GET  /Api/v3/contatos
 GET  /Api/v3/contas/receber
+POST /Api/v3/contas/receber
 GET  /Api/v3/contas/receber/{id}
 GET  /Api/v3/contas/pagar
+POST /Api/v3/contas/pagar
 GET  /Api/v3/contas/pagar/{id}
 GET  /Api/v3/contas-contabeis
 GET  /Api/v3/categorias/receitas-despesas
 GET  /Api/v3/caixas
+POST /Api/v3/caixas
 ```
 
 Base:
@@ -471,4 +523,4 @@ A API do Bling limita filtros de período a no máximo um ano e usa paginação.
 PYTHONPATH=. python -m unittest discover -s tests -v
 ```
 
-A versão entregue foi validada com `compileall`, 17 testes unitários e smoke tests cobrindo os 15 relatórios, SQLite, classificação, calibração de saldo, períodos em linguagem natural e comparações.
+A versão entregue foi validada com `compileall` e 23 testes unitários, incluindo os relatórios existentes, SQLite, classificação, calibração de saldo, filtros de categoria e os payloads de criação de conta a pagar, conta a receber e lançamento de caixa. Os testes de integração real com a sua conta Bling devem ser feitos após o deploy, porque exigem os seus tokens e permissões OAuth.

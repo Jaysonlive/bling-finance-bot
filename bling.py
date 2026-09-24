@@ -182,7 +182,7 @@ class BlingClient:
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "enable-jwt": "1",
-                "User-Agent": "bling-finance-telegram-bot/1.2",
+                "User-Agent": "bling-finance-telegram-bot/1.3",
             },
         )
 
@@ -396,6 +396,7 @@ class BlingClient:
         path: str,
         *,
         params: Sequence[tuple[str, Any]] | dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         refreshed_after_401 = False
 
@@ -412,6 +413,7 @@ class BlingClient:
                     method,
                     path,
                     params=params,
+                    json=json_body,
                     headers=headers,
                 )
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -736,6 +738,162 @@ class BlingClient:
         seeded = await asyncio.to_thread(self.cash_db.auto_classify_unmapped)
         logger.info("Categorias financeiras sincronizadas: %d; classificações iniciais: %d", count, seeded)
         return count
+
+    async def search_contacts(self, query: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        """Search Bling contacts by name, CPF/CNPJ, fantasy name, e-mail or code."""
+        query = query.strip()
+        if not query:
+            return []
+        payload = await self._request(
+            "GET",
+            "/contatos",
+            params=[
+                ("pagina", 1),
+                ("limite", min(max(1, int(limit)), 100)),
+                ("criterio", 1),
+                ("pesquisa", query),
+            ],
+        )
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+        result: list[dict[str, Any]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            contact_id = str(row.get("id") or "").strip()
+            name = str(row.get("nome") or row.get("fantasia") or "").strip()
+            if not contact_id or not name:
+                continue
+            if str(row.get("situacao") or "A").upper() == "E":
+                continue
+            result.append(
+                {
+                    "id": contact_id,
+                    "name": name,
+                    "document": str(row.get("numeroDocumento") or "").strip(),
+                    "code": str(row.get("codigo") or "").strip(),
+                }
+            )
+        return result[:limit]
+
+    @staticmethod
+    def _created_id(payload: dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        direct = payload.get("id")
+        if direct not in (None, ""):
+            return str(direct)
+        data = payload.get("data")
+        if isinstance(data, dict) and data.get("id") not in (None, ""):
+            return str(data.get("id"))
+        return ""
+
+    async def create_payable(
+        self,
+        *,
+        contact_id: str,
+        amount: Decimal,
+        due_date: date,
+        competence: date,
+        category_id: str,
+        history: str = "",
+        financial_account_id: str | None = None,
+        emission_date: date | None = None,
+    ) -> str:
+        body: dict[str, Any] = {
+            "contato": {"id": int(contact_id)},
+            "valor": float(amount),
+            "vencimento": due_date.isoformat(),
+            "dataEmissao": (emission_date or date.today()).isoformat(),
+            "competencia": competence.isoformat(),
+            "historico": history.strip(),
+            "categoria": {"id": int(category_id)},
+            "ocorrencia": {"tipo": 1},
+        }
+        if financial_account_id:
+            body["portador"] = {"id": int(financial_account_id)}
+        payload = await self._request("POST", "/contas/pagar", json_body=body)
+        created_id = self._created_id(payload)
+        if not created_id:
+            raise BlingAPIError("Conta a pagar criada, mas o Bling não retornou o ID esperado.")
+        return created_id
+
+    async def create_receivable(
+        self,
+        *,
+        contact_id: str,
+        amount: Decimal,
+        due_date: date,
+        competence: date,
+        category_id: str,
+        history: str = "",
+        financial_account_id: str | None = None,
+        emission_date: date | None = None,
+    ) -> str:
+        body: dict[str, Any] = {
+            "contato": {"id": int(contact_id)},
+            "valor": float(amount),
+            "vencimento": due_date.isoformat(),
+            "dataEmissao": (emission_date or date.today()).isoformat(),
+            "competencia": competence.isoformat(),
+            "historico": history.strip(),
+            "categoria": {"id": int(category_id)},
+            "ocorrencia": {"tipo": 1},
+        }
+        if financial_account_id:
+            body["portador"] = {"id": int(financial_account_id)}
+        payload = await self._request("POST", "/contas/receber", json_body=body)
+        created_id = self._created_id(payload)
+        if not created_id:
+            raise BlingAPIError("Conta a receber criada, mas o Bling não retornou o ID esperado.")
+        return created_id
+
+    async def create_cash_entry(
+        self,
+        *,
+        contact_id: str,
+        amount: Decimal,
+        movement_date: date,
+        competence: date,
+        category_id: str,
+        financial_account_id: str,
+        direction: str,
+        history: str = "",
+    ) -> str:
+        direction = direction.strip().upper()
+        if direction not in {"C", "D"}:
+            raise ValueError("direction deve ser C ou D")
+        base: dict[str, Any] = {
+            "data": movement_date.isoformat(),
+            "valor": float(amount),
+            "debCred": direction,
+            "competencia": competence.isoformat(),
+            "observacoes": history.strip() or "Lançamento pelo Telegram",
+            "categoria": {"id": int(category_id)},
+            "contato": {"id": int(contact_id)},
+        }
+        # The current Bling OpenAPI requires idContaContabil. Keep the first
+        # request minimal and standards-compliant. A compatibility retry adds
+        # contaFinanceira.id for accounts where the API gateway expects the
+        # nested reference as well.
+        first = dict(base)
+        first["idContaContabil"] = int(financial_account_id)
+        try:
+            payload = await self._request("POST", "/caixas", json_body=first)
+        except BlingAPIError as exc:
+            if "HTTP 400" not in str(exc):
+                raise
+            second = dict(first)
+            second["contaFinanceira"] = {"id": int(financial_account_id)}
+            payload = await self._request("POST", "/caixas", json_body=second)
+        created_id = self._created_id(payload)
+        if not created_id:
+            raise BlingAPIError("Lançamento de caixa criado, mas o Bling não retornou o ID esperado.")
+        # Keep SQLite fresh without rescanning historical years.
+        try:
+            await self.resync_cash_period(movement_date, movement_date)
+        except BlingError as exc:
+            logger.warning("Lançamento criado no Bling, mas o cache local do dia não foi atualizado: %s", exc)
+        return created_id
 
     async def list_cash_entries(
         self,

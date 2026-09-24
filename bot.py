@@ -26,6 +26,14 @@ from telegram.ext import (
 from bling import BlingAPIError, BlingAuthError, BlingClient
 from config import ConfigError, Settings
 from services import ReportService
+from entry_flow import (
+    ENTRY_DRAFT_KEY,
+    clear_entry_draft,
+    entry_menu_keyboard,
+    handle_entry_callback,
+    handle_entry_text,
+    start_entry_flow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +110,7 @@ def format_period(start: date, end: date) -> str:
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("➕ Novo lançamento", callback_data="entry:menu")],
             [InlineKeyboardButton("💳 Saldos — Caixas e Bancos", callback_data="cash:menu")],
             [InlineKeyboardButton("💼 Posição financeira", callback_data="position:menu")],
             [InlineKeyboardButton("💸 Contas a pagar", callback_data="choose:pay")],
@@ -313,10 +322,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await ensure_allowed(update, context):
         return
     context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    clear_entry_draft(context)
 
     await update.effective_message.reply_text(
         "Financeiro Bling\n\n"
-        "Consulte saldos registrados em Caixas e Bancos, títulos pendentes e projeções financeiras.\n"
+        "Consulte saldos, títulos, projeções e relatórios ou crie contas e lançamentos de caixa direto pelo Telegram.\n"
         "Escolha uma opção:",
         reply_markup=menu_keyboard(),
     )
@@ -324,6 +334,46 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start_command(update, context)
+
+
+async def lancar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    clear_entry_draft(context)
+    await update.effective_message.reply_text(
+        "➕ Lançamentos financeiros\n\n"
+        "Escolha o tipo de lançamento. Antes de gravar no Bling, o bot mostra todos os dados para confirmação.",
+        reply_markup=entry_menu_keyboard(),
+    )
+
+
+async def nova_pagar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    await start_entry_flow(update, context, "payable")
+
+
+async def nova_receber_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    await start_entry_flow(update, context, "receivable")
+
+
+async def caixa_saida_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    await start_entry_flow(update, context, "cash_out")
+
+
+async def caixa_entrada_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    await start_entry_flow(update, context, "cash_in")
 
 
 async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -758,6 +808,9 @@ async def natural_language_message(update: Update, context: ContextTypes.DEFAULT
         except Exception as exc:
             await message.reply_text(f"⚠️ Não consegui calibrar: {exc}\nTente novamente ou envie /menu para cancelar.")
         return
+    if context.user_data.get(ENTRY_DRAFT_KEY):
+        if await handle_entry_text(update, context):
+            return
     await _run_management_report(update, context, message.text)
 
 
@@ -1133,7 +1186,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     data = query.data or ""
 
+    if data.startswith("entry:"):
+        if await handle_entry_callback(update, context, data):
+            return
+
     if data == "menu":
+        clear_entry_draft(context)
+        context.user_data.pop(CALIBRATION_PENDING_KEY, None)
         await query.edit_message_text(
             "Financeiro Bling — escolha uma opção:", reply_markup=menu_keyboard()
         )
@@ -1421,6 +1480,11 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Abrir menu financeiro"),
+            BotCommand("lancar", "Adicionar conta ou lançamento de caixa"),
+            BotCommand("nova_pagar", "Criar uma conta a pagar"),
+            BotCommand("nova_receber", "Criar uma conta a receber"),
+            BotCommand("caixa_saida", "Registrar pagamento à vista"),
+            BotCommand("caixa_entrada", "Registrar recebimento à vista"),
             BotCommand("saldos", "Saldos de Caixas e Bancos"),
             BotCommand("posicao", "Saldo atual + projeção financeira"),
             BotCommand("fluxo", "Fluxo por período ou datas livres"),
@@ -1492,6 +1556,11 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("lancar", lancar_command))
+    application.add_handler(CommandHandler("nova_pagar", nova_pagar_command))
+    application.add_handler(CommandHandler("nova_receber", nova_receber_command))
+    application.add_handler(CommandHandler("caixa_saida", caixa_saida_command))
+    application.add_handler(CommandHandler("caixa_entrada", caixa_entrada_command))
     application.add_handler(CommandHandler("pagar", pay_command))
     application.add_handler(CommandHandler("receber", receive_command))
     application.add_handler(CommandHandler("saldos", saldos_command))

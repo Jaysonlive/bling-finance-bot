@@ -709,6 +709,43 @@ class FinanceDB:
             rows = conn.execute(sql).fetchall()
         return [dict(row) for row in rows]
 
+    def search_categories(
+        self,
+        query: str,
+        *,
+        limit: int = 8,
+        category_type: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return likely active category matches for interactive Telegram selection.
+
+        Bling uses category type 1 for expense, 2 for revenue and 3 for a
+        category that can be used for both. When ``category_type`` is supplied,
+        type 3 remains eligible.
+        """
+        needle = normalize_text(query)
+        if not needle:
+            return []
+        rows = self.list_categories(active_only=True)
+        ranked: list[tuple[float, int, dict[str, Any]]] = []
+        for row in rows:
+            row_type = int(row.get("category_type") or 0)
+            if category_type in {1, 2} and row_type not in {category_type, 3}:
+                continue
+            description = str(row.get("description") or "")
+            normalized = normalize_text(description)
+            if not normalized:
+                continue
+            if normalized == needle or str(row.get("category_id") or "") == query.strip():
+                score = 3.0
+            elif needle in normalized:
+                score = 2.0 + min(0.9, len(needle) / max(1, len(normalized)))
+            else:
+                score = SequenceMatcher(None, needle, normalized).ratio()
+            if score >= 0.45:
+                ranked.append((score, -len(description), row))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [row for _, _, row in ranked[: max(1, int(limit))]]
+
     def resolve_category(self, query: str) -> dict[str, Any] | None:
         needle = normalize_text(query)
         if not needle:
