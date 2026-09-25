@@ -34,6 +34,16 @@ from entry_flow import (
     handle_entry_text,
     start_entry_flow,
 )
+from financial_card_flow import (
+    CARD_DRAFT_KEY,
+    clear_financial_card_draft,
+    detect_financial_card_query,
+    financial_card_menu_keyboard,
+    handle_financial_card_callback,
+    handle_financial_card_text,
+    start_financial_card_flow,
+    start_financial_card_from_natural_language,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +125,7 @@ def menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("💼 Posição financeira", callback_data="position:menu")],
             [InlineKeyboardButton("💸 Contas a pagar", callback_data="choose:pay")],
             [InlineKeyboardButton("💰 Contas a receber", callback_data="choose:recv")],
+            [InlineKeyboardButton("📒 Ficha financeira", callback_data="card:menu")],
             [InlineKeyboardButton("📊 Fluxo líquido", callback_data="choose:flow")],
             [InlineKeyboardButton("📚 Relatórios gerenciais", callback_data="reports:menu")],
             [InlineKeyboardButton("🔄 Sincronização", callback_data="sync:menu")],
@@ -323,6 +334,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     context.user_data.pop(CALIBRATION_PENDING_KEY, None)
     clear_entry_draft(context)
+    clear_financial_card_draft(context)
 
     await update.effective_message.reply_text(
         "Financeiro Bling\n\n"
@@ -390,6 +402,30 @@ async def receive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.effective_message.reply_text(
         "💰 Contas a receber — escolha o período:", reply_markup=period_keyboard("recv")
     )
+
+
+async def ficha_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    clear_entry_draft(context)
+    await start_financial_card_flow(update, context)
+
+
+async def ficha_pagar_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    clear_entry_draft(context)
+    await start_financial_card_flow(update, context, "payable")
+
+
+async def ficha_receber_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_allowed(update, context):
+        return
+    context.user_data.pop(CALIBRATION_PENDING_KEY, None)
+    clear_entry_draft(context)
+    await start_financial_card_flow(update, context, "receivable")
 
 
 async def saldos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -811,6 +847,16 @@ async def natural_language_message(update: Update, context: ContextTypes.DEFAULT
     if context.user_data.get(ENTRY_DRAFT_KEY):
         if await handle_entry_text(update, context):
             return
+    if context.user_data.get(CARD_DRAFT_KEY):
+        if await handle_financial_card_text(update, context):
+            return
+    card_query = detect_financial_card_query(message.text)
+    if card_query:
+        kind, contact_query, period = card_query
+        await start_financial_card_from_natural_language(
+            update, context, kind, contact_query, period
+        )
+        return
     await _run_management_report(update, context, message.text)
 
 
@@ -1190,8 +1236,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if await handle_entry_callback(update, context, data):
             return
 
+    if data.startswith("card:"):
+        if await handle_financial_card_callback(update, context, data):
+            return
+
     if data == "menu":
         clear_entry_draft(context)
+        clear_financial_card_draft(context)
         context.user_data.pop(CALIBRATION_PENDING_KEY, None)
         await query.edit_message_text(
             "Financeiro Bling — escolha uma opção:", reply_markup=menu_keyboard()
@@ -1490,6 +1541,9 @@ async def post_init(application: Application) -> None:
             BotCommand("fluxo", "Fluxo por período ou datas livres"),
             BotCommand("pagar", "Contas a pagar"),
             BotCommand("receber", "Contas a receber"),
+            BotCommand("ficha", "Ficha financeira por fornecedor/cliente"),
+            BotCommand("ficha_pagar", "Quanto devo a um fornecedor"),
+            BotCommand("ficha_receber", "Quanto um cliente me deve"),
             BotCommand("autorizar", "Autorizar ou reautorizar o Bling"),
             BotCommand("status_bling", "Ver status da conexão com o Bling"),
             BotCommand("relatorios", "Abrir relatórios gerenciais"),
@@ -1563,6 +1617,9 @@ def main() -> None:
     application.add_handler(CommandHandler("caixa_entrada", caixa_entrada_command))
     application.add_handler(CommandHandler("pagar", pay_command))
     application.add_handler(CommandHandler("receber", receive_command))
+    application.add_handler(CommandHandler("ficha", ficha_command))
+    application.add_handler(CommandHandler("ficha_pagar", ficha_pagar_command))
+    application.add_handler(CommandHandler("ficha_receber", ficha_receber_command))
     application.add_handler(CommandHandler("saldos", saldos_command))
     application.add_handler(CommandHandler("posicao", posicao_command))
     application.add_handler(CommandHandler("fluxo", fluxo_command))

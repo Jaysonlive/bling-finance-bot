@@ -1,6 +1,6 @@
-# Bling Finance Bot v8 — Telegram + SQLite + Relatórios + Lançamentos
+# Bling Finance Bot v9 — Telegram + SQLite + Relatórios + Lançamentos + Ficha financeira
 
-Bot financeiro em Python para Telegram integrado à API v3 do Bling. A versão v8 mantém a arquitetura que deixa de reconstruir anos de histórico a cada consulta e acrescenta criação segura de contas e lançamentos pelo Telegram: usa **SQLite persistente** em `/app/data/financeiro.db`, sincronização incremental e uma camada central de relatórios reutilizável.
+Bot financeiro em Python para Telegram integrado à API v3 do Bling. A versão v9 mantém a arquitetura que deixa de reconstruir anos de histórico a cada consulta e acrescenta criação segura de contas e lançamentos pelo Telegram: usa **SQLite persistente** em `/app/data/financeiro.db`, sincronização incremental e uma camada central de relatórios reutilizável.
 
 O bot usa **long polling**, portanto não precisa expor porta HTTP nem domínio no EasyPanel.
 
@@ -55,6 +55,61 @@ Para lançamentos à vista, depois da criação o bot ressincroniza **somente o 
 
 > Nesta versão o fornecedor/cliente e a categoria precisam já existir no Bling. O bot pesquisa e seleciona os cadastros existentes; ele não cria um novo contato ou uma nova categoria automaticamente.
 
+## Ficha financeira por fornecedor ou cliente
+
+A v9 acrescenta uma consulta de **títulos pendentes por contato**, feita diretamente no Bling para refletir a posição atual de contas a pagar/receber. Ela considera títulos **em aberto** e **parcialmente pagos/recebidos** e filtra pelo **vencimento**.
+
+Abra pelo botão **📒 Ficha financeira** ou use:
+
+```text
+/ficha
+/ficha_pagar
+/ficha_receber
+```
+
+Fluxo:
+
+```text
+Escolher A pagar / A receber
+→ pesquisar fornecedor ou cliente por nome, CPF ou CNPJ
+→ selecionar o contato correto
+→ escolher Hoje / Semana / Mês / Ano / Entre datas
+→ consultar títulos pendentes do contato
+→ listar vencimento, saldo em aberto de cada título e total
+```
+
+Exemplo de resposta:
+
+```text
+📒 FICHA FINANCEIRA — A PAGAR
+👤 Fornecedor: DISCFONE DISTRIBUIDORA LTDA
+📅 Vencimentos: 01/09/2026 a 30/09/2026
+
+💸 Total devido: R$ 3.250,40
+📄 Títulos pendentes: 4
+
+📆 VENCIMENTOS
+1. 10/09/2026 — R$ 850,00
+   🔴 vencido há 15 dias
+2. 26/09/2026 — R$ 1.200,40
+   🟢 vence em 1 dia
+3. 30/09/2026 — R$ 1.200,00
+   🟢 vence em 5 dias • parcial
+```
+
+Para títulos parciais, o bot consulta o detalhe e usa o campo **saldo restante**, não o valor original do título. Isso evita somar novamente uma parte que já foi paga ou recebida.
+
+Também há interpretação direta de frases claras como:
+
+```text
+Quanto devo para Discfone este mês?
+Quanto tenho a pagar para Khronos este ano?
+Quanto tenho a receber de Residencial Arthur este mês?
+Quanto Residencial Arthur me deve?
+```
+
+A busca usa o `idContato` selecionado e o período de vencimento na própria API; portanto, não precisa baixar todas as contas da empresa para depois filtrar no bot.
+
 ## Banco local
 
 Arquivo persistente:
@@ -103,7 +158,7 @@ Esse período é buscado uma única vez e fica salvo. Se você nunca alterar 202
 
 ## Saldos de Caixas e Bancos
 
-A API usada neste projeto fornece os lançamentos de Caixas e Bancos, mas o saldo atual exibido no painel do Bling não é tratado como um campo confiável do catálogo de contas. Por isso a v8 usa **saldo-base calibrado uma única vez**.
+A API usada neste projeto fornece os lançamentos de Caixas e Bancos, mas o saldo atual exibido no painel do Bling não é tratado como um campo confiável do catálogo de contas. Por isso a v9 usa **saldo-base calibrado uma única vez**.
 
 Fluxo recomendado:
 

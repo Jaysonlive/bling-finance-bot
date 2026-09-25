@@ -72,6 +72,32 @@ class FinancialSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ContactAccountItem:
+    account_id: str
+    due_date: date
+    outstanding: Decimal
+    original_value: Decimal
+    status: int
+
+    @property
+    def partial(self) -> bool:
+        return self.status == 3
+
+
+@dataclass(frozen=True, slots=True)
+class ContactAccountCard:
+    kind: str
+    contact_id: str
+    start: date
+    end: date
+    items: tuple[ContactAccountItem, ...]
+
+    @property
+    def total(self) -> Decimal:
+        return sum((item.outstanding for item in self.items), Decimal("0"))
+
+
+@dataclass(frozen=True, slots=True)
 class CashMovement:
     id: str
     account_id: str
@@ -534,7 +560,9 @@ class BlingClient:
                 by_id[row_id] = row
         return list(by_id.values()) + without_id
 
-    async def list_open_receivables(self, start: date, end: date) -> list[dict[str, Any]]:
+    async def list_open_receivables(
+        self, start: date, end: date, *, contact_id: str | int | None = None
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for chunk_start, chunk_end in self._split_date_range(start, end):
             params: list[tuple[str, Any]] = [
@@ -544,20 +572,26 @@ class BlingClient:
                 ("dataInicial", chunk_start.isoformat()),
                 ("dataFinal", chunk_end.isoformat()),
             ]
+            if contact_id not in (None, ""):
+                params.append(("idContato", int(contact_id)))
             rows.extend(await self._paginate("/contas/receber", params))
         return self._deduplicate(rows)
 
-    async def list_open_payables(self, start: date, end: date) -> list[dict[str, Any]]:
+    async def list_open_payables(
+        self, start: date, end: date, *, contact_id: str | int | None = None
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for chunk_start, chunk_end in self._split_date_range(start, end):
-            # The current payable endpoint accepts a single `situacao` value,
-            # so open (1) and partial (3) are paginated independently.
+            # The payable endpoint accepts a single `situacao` value, so open
+            # (1) and partial (3) are paginated independently.
             for status in (1, 3):
                 params: list[tuple[str, Any]] = [
                     ("dataVencimentoInicial", chunk_start.isoformat()),
                     ("dataVencimentoFinal", chunk_end.isoformat()),
                     ("situacao", status),
                 ]
+                if contact_id not in (None, ""):
+                    params.append(("idContato", int(contact_id)))
                 rows.extend(await self._paginate("/contas/pagar", params))
         return self._deduplicate(rows)
 
@@ -615,6 +649,75 @@ class BlingClient:
             end=end,
             receivable=receivable,
             payable=payable,
+        )
+
+
+    async def get_contact_account_card(
+        self,
+        kind: str,
+        contact_id: str | int,
+        start: date,
+        end: date,
+    ) -> ContactAccountCard:
+        """Return pending titles for one contact filtered by due date.
+
+        The Bling API performs the contact/date filtering server-side. Open
+        titles use their face value; partially paid/received titles fetch the
+        detail endpoint so the report uses the remaining `saldo` instead of
+        overstating the debt with the original value.
+        """
+        if kind not in {"payable", "receivable"}:
+            raise ValueError("kind deve ser 'payable' ou 'receivable'.")
+        cid = str(contact_id).strip()
+        if not cid:
+            raise ValueError("Contato não informado.")
+        if kind == "payable":
+            rows = await self.list_open_payables(start, end, contact_id=cid)
+            detail_kind = "pagar"
+        else:
+            rows = await self.list_open_receivables(start, end, contact_id=cid)
+            detail_kind = "receber"
+
+        items: list[ContactAccountItem] = []
+        for row in rows:
+            account_id = str(row.get("id") or "").strip()
+            if not account_id:
+                continue
+            due = self._parse_api_date(row.get("vencimento"))
+            if due is None:
+                continue
+            try:
+                status = int(row.get("situacao") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            original = self._to_decimal(row.get("valor"))
+            if status == 3:
+                detail = await self._get_account_detail(detail_kind, account_id)
+                outstanding = self._to_decimal(detail.get("saldo"))
+            else:
+                outstanding = self._to_decimal(self._first_value(row, "saldo", "valor"))
+            # Defensive: returned data is already filtered by date, but keeping
+            # this check protects the UI from malformed/out-of-range API rows.
+            if due < start or due > end:
+                continue
+            if outstanding < 0:
+                outstanding = Decimal("0")
+            items.append(
+                ContactAccountItem(
+                    account_id=account_id,
+                    due_date=due,
+                    outstanding=outstanding,
+                    original_value=original,
+                    status=status,
+                )
+            )
+        items.sort(key=lambda item: (item.due_date, item.account_id))
+        return ContactAccountCard(
+            kind=kind,
+            contact_id=cid,
+            start=start,
+            end=end,
+            items=tuple(items),
         )
 
     @staticmethod
